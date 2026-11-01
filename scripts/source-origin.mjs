@@ -58,6 +58,7 @@ const INTERNATIONAL_HOST_SUFFIXES = [
   '.unep.org',
   '.unesco.org',
   '.unhcr.org',
+  '.unognewsroom.org',
   '.who.int',
   '.worldbank.org',
   '.wto.org',
@@ -66,6 +67,14 @@ const INTERNATIONAL_HOST_SUFFIXES = [
 // Host → ISO 3166-1 alpha-2, 'EU', or null (international).
 // Only hosts that cannot be inferred from a real ccTLD or government suffix.
 const HOST_ORIGINS = Object.freeze({
+  'api.cammesa.com': 'AR',
+  'admin.gse.com.ge': 'GE',
+  'erp.powergrid.gov.bd': 'BD',
+  'petrobangla.org.bd': 'BD',
+  'niggrid.org': 'NG',
+  'eskom.co.za': 'ZA',
+  'dados.ons.org.br': 'BR',
+  'www.datos.gov.co': 'CO',
   // Editorial hosts used by site-scoped news searches. These are catalogued
   // as publishers in their own right; the shared search endpoint is a
   // separate provider.
@@ -84,6 +93,7 @@ const HOST_ORIGINS = Object.freeze({
   'ayibopost.com': 'HT',
   'bangkokpost.com': 'TH',
   'bellingcat.com': 'NL',
+  'besttime.app': 'NL',
   'bihus.info': 'UA',
   'binance.com': null,
   'bloomberg.com': 'US',
@@ -156,6 +166,8 @@ const HOST_ORIGINS = Object.freeze({
   'zerkalo.io': 'BY',
   'acleddata.com': 'US',
   'adsb.lol': 'NL',
+  // Republishes UK Maritime Trade Operations reports; the catalog origin is the reporting authority.
+  'hormuz.data-tracking.net': 'GB',
   'api.adsb.lol': 'NL',
   'aerotime.aero': 'LT',
   'agentskills.io': 'US',
@@ -205,6 +217,7 @@ const HOST_ORIGINS = Object.freeze({
   'api.search.brave.com': 'US',
   'api.spdrgoldshares.com': 'US',
   'api.stlouisfed.org': 'US',
+  'fred.stlouisfed.org': 'US',
   'api.telegram.org': 'AE',
   'api.travelpayouts.com': 'CY',
   'api.tzevaadom.co.il': 'IL',
@@ -268,6 +281,7 @@ const HOST_ORIGINS = Object.freeze({
   'feeds.news24.com': 'ZA',
   'feeds.npr.org': 'US',
   'financialpost.com': 'CA',
+  'factchecktools.googleapis.com': 'US',
   'finnhub.io': 'US',
   'foreignpolicy.com': 'US',
   'fr.africanews.com': null,
@@ -325,7 +339,6 @@ const HOST_ORIGINS = Object.freeze({
   'opensky-network.org': 'CH',
   'ottawacitizen.com': 'CA',
   'otx.alienvault.com': 'US',
-  'outbreaknewstoday.com': 'US',
   'ourworldindata.org': 'GB',
   'owid-public.owid.io': 'GB',
   'patents.google.com': 'US',
@@ -409,6 +422,7 @@ const HOST_ORIGINS = Object.freeze({
   'www.africanews.com': null,
   'www.aajtak.in': 'IN',
   'www.alarabiya.net': 'SA',
+  'aljazeera.com': 'QA',
   'www.aljazeera.com': 'QA',
   'www.aljazeera.net': 'QA',
   'www.alphavantage.co': 'US',
@@ -515,7 +529,7 @@ const HOST_ORIGINS = Object.freeze({
   'www.reddit.com': 'US',
   'www.replicatestatus.com': 'US',
   'www.rigzone.com': 'US',
-  'www.rt.com': 'RU',
+  'rt-english.com': 'RU',
   'www.saastr.com': 'US',
   'www.schneier.com': 'US',
   'www.sciencedaily.com': 'US',
@@ -558,6 +572,7 @@ const HOST_ORIGINS = Object.freeze({
   'www.zdnet.com': 'US',
   'www.zoomstatus.com': 'US',
   'arxiv.org': 'US',
+  'economist.com': 'GB',
   'fc.yahoo.com': 'US',
   'finance.yahoo.com': 'US',
   'news.usni.org': 'US',
@@ -565,7 +580,14 @@ const HOST_ORIGINS = Object.freeze({
   'your-app.convex.site': 'US',
   'yourstory.com': 'IN',
   'gamma-api.polymarket.com': 'US',
+  'independent.co.uk': 'GB',
+  'japantimes.co.jp': 'JP',
+  'middleeasteye.net': 'GB',
+  'news.sky.com': 'GB',
   'noaadata.apps.nsidc.org': 'US',
+  'nytimes.com': 'US',
+  'timesofisrael.com': 'IL',
+  'washingtonpost.com': 'US',
 });
 
 // Provider-level overrides win when the host is a CDN, cloud, or shared

@@ -1014,7 +1014,7 @@ function normalizeNumberWordFact(raw) {
   return `number:${formatNumericFact(value)}${percent ? '%' : ''}`;
 }
 
-function addDateFact(facts, year, month, day) {
+function addDateFact(facts, year, month, day, dateParts = true) {
   const monthNumber = Number(month);
   const dayNumber = Number(day);
   if (!Number.isInteger(monthNumber) || !Number.isInteger(dayNumber)) return;
@@ -1024,36 +1024,38 @@ function addDateFact(facts, year, month, day) {
   facts.add(`date:${monthPart}-${dayPart}`);
   // Keep the components available for prose that says only "in 2026" or
   // "on the 1st" while the full date expression still requires an exact match.
-  facts.add(`number:${formatNumericFact(monthNumber)}`);
-  facts.add(`number:${formatNumericFact(dayNumber)}`);
+  if (dateParts) {
+    facts.add(`number:${formatNumericFact(monthNumber)}`);
+    facts.add(`number:${formatNumericFact(dayNumber)}`);
+  }
   if (year != null && year !== '') {
     const yearNumber = Number(year);
     if (Number.isInteger(yearNumber)) {
       facts.add(`date:${yearNumber}-${monthPart}-${dayPart}`);
-      facts.add(`number:${formatNumericFact(yearNumber)}`);
+      if (dateParts) facts.add(`number:${formatNumericFact(yearNumber)}`);
     }
   }
 }
 
-function addDateExpressionFacts(facts, raw) {
+function addDateExpressionFacts(facts, raw, dateParts) {
   const normalized = raw.trim().replace(/\s+/g, ' ');
   let match = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (match) {
-    addDateFact(facts, match[1], match[2], match[3]);
+    addDateFact(facts, match[1], match[2], match[3], dateParts);
     return;
   }
   match = normalized.match(/^(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?$/);
   if (match) {
-    addDateFact(facts, match[3], match[1], match[2]);
+    addDateFact(facts, match[3], match[1], match[2], dateParts);
     return;
   }
   match = normalized.match(/^([A-Za-z]+)\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?$/);
   if (match) {
-    addDateFact(facts, match[3], DATE_MONTH_NUMBERS.get(match[1].toLowerCase()), match[2]);
+    addDateFact(facts, match[3], DATE_MONTH_NUMBERS.get(match[1].toLowerCase()), match[2], dateParts);
     return;
   }
   match = normalized.match(/^(\d{1,2})\s+([A-Za-z]+)\.?\s*(?:\s+(\d{4}))?$/);
-  if (match) addDateFact(facts, match[3], DATE_MONTH_NUMBERS.get(match[2].toLowerCase()), match[1]);
+  if (match) addDateFact(facts, match[3], DATE_MONTH_NUMBERS.get(match[2].toLowerCase()), match[1], dateParts);
 }
 
 /**
@@ -1062,16 +1064,21 @@ function addDateExpressionFacts(facts, raw) {
  * the same value ("9" and "nine"). This is intentionally a fact-presence
  * check, not a full source fact-checker.
  *
+ * A date also yields its month, day and year as numbers unless
+ * `dateParts: false`, which a caller listing the figures a text states uses
+ * so a count equal to a date part ("kills 9 on October 9") stays its own fact.
+ *
  * @param {string} text
+ * @param {{ dateParts?: boolean }} [options]
  * @returns {Set<string>}
  */
-export function extractNumericFacts(text) {
+export function extractNumericFacts(text, { dateParts = true } = {}) {
   const facts = new Set();
   if (typeof text !== 'string' || text.length === 0) return facts;
 
   let remaining = text.replace(/\[\d{1,3}\]/g, ' ');
   remaining = remaining.replace(DATE_EXPRESSION_RE, (match) => {
-    addDateExpressionFacts(facts, match);
+    addDateExpressionFacts(facts, match, dateParts);
     return ' '.repeat(match.length);
   });
   remaining = remaining.replace(DIGIT_FACT_RE, (match, offset, original) => {
@@ -1124,11 +1131,26 @@ const PERSON_TITLE_WORDS =
   + 'chairman|chairwoman|chairperson|chair|chief|ceo|cfo|ambassador|envoy|speaker|king|queen|pope|leader|'
   + 'commander|general|admiral|director|prosecutor|judge|justice|adviser|advisor|aide|spokesman|spokeswoman|'
   + 'spokesperson|head|official|lawmaker|congressman|congresswoman|representative|pm';
+// Lowercase words that can sit inside an office name between the qualifier
+// and the title: "former deputy prime minister", "former national security adviser".
+const OFFICE_MODIFIER_WORDS =
+  'deputy|vice|assistant|associate|senior|national|security|foreign|defense|defence|finance|interior|'
+  + 'justice|health|trade|energy|state|army|military|intelligence|supreme|party|attorney|federal|regional';
+const CALENDAR_WORDS =
+  'Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|January|February|March|April|May|June|July|'
+  + 'August|September|October|November|December';
 // No `i` flag: under `i`, \p{Lu} also matches lowercase, so "Former officials said" reads as a named person.
 const anyCase = (/** @type {string} */ word) => word.replace(/\p{L}/gu, (c) => `[${c.toUpperCase()}${c}]`);
+const PERSON_TITLE_RE_SOURCE = PERSON_TITLE_WORDS.split('|').map(anyCase).join('|');
+// A bridge word is part of the office name: a nationality or institution
+// ("US", "Brazilian", "White House"), an office modifier, or a title word
+// ("official adviser"). Any other word ends the match, so "Former officials
+// said President Trump" and "Late on Tuesday President Trump" qualify nobody.
+const BRIDGE_WORD_RE_SOURCE = `(?:(?!(?:${CALENDAR_WORDS})\\b)\\p{Lu}[\\p{L}'’-]*`
+  + `|${OFFICE_MODIFIER_WORDS.split('|').map(anyCase).join('|')}|${PERSON_TITLE_RE_SOURCE})`;
 const STATUS_QUALIFIER_RE = new RegExp(
   `\\b(${STATUS_QUALIFIER_CLASSES.flat().map((q) => (q.endsWith('-') ? `${anyCase(q.slice(0, -1))}(?=-)` : anyCase(q))).join('|')})[-\\s]+`
-  + `(?:[\\p{L}'’-]+\\s+){0,3}?(?:${PERSON_TITLE_WORDS.split('|').map(anyCase).join('|')})s?\\b[-\\s]+(?:(?:of|the|for|to|and)\\s+)?(\\p{Lu}[\\p{L}'’-]+)`,
+  + `(?:${BRIDGE_WORD_RE_SOURCE}\\s+){0,3}?(?:${PERSON_TITLE_RE_SOURCE})s?\\b[-\\s]+(?:(?:of|the|for|to|and)\\s+)?(\\p{Lu}[\\p{L}'’-]+)`,
   'gu',
 );
 

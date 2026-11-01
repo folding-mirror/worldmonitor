@@ -141,25 +141,24 @@ trap post_pending_on_exit EXIT
 # while this gate still posts success — CI theatre, not a gate (#5402).
 # tests/ci-workflow-coverage.test.mts fails when this list and those
 # workflows drift apart in either direction. `audit-lockfile` is
-# deliberately absent: it is a matrix job whose check runs are named
-# `audit-lockfile (root)`, `audit-lockfile (scripts)`, … so a bare
-# entry would wait on a check run that is never published; the
-# always()-running `security-audit` aggregate blocks for it instead.
+# deliberately absent: the always()-running `security-audit`
+# aggregate evaluates its per-lockfile verdicts and covers it instead.
 #
 # Entries are check-run NAMES, and the lookup below keeps only the
 # last-completed run per name. Test, Typecheck and Lint Code each
 # define a job with the id `changes`; the latter two publish under
 # `typecheck-changes` / `lint-changes` so all three are evaluated
 # instead of two being masked by the third (#5822).
-required='["changes","typecheck-changes","lint-changes","docs-stats","unit","consumer-prices","umami-postgres","sidecar","convex-tests","dom-tests","desktop-config","desktop-rust","variant-smoke-full","resilience-validation-smoke","digest-image","typecheck","biome","markdown","public-docs","mintlify-slugs","doc-anchors","security-audit","stacked-merge-guard","proto-changes","proto-breaking","fork-artifact-check","internal-generate","internal-auto-generate","internal-merge-freshness","proto-freshness"]'
+required='["changes","typecheck-changes","lint-changes","docs-stats","unit","consumer-prices","umami-postgres","sidecar","convex-tests","dom-tests","desktop-config","desktop-node-windows","desktop-rust","variant-smoke-full","resilience-validation-smoke","digest-image","typecheck","biome","markdown","public-docs","mintlify-slugs","doc-anchors","security-audit","stacked-merge-guard","proto-changes","proto-breaking","fork-artifact-check","internal-generate","internal-auto-generate","internal-merge-freshness","proto-freshness","zapier"]'
 # The contract stamp covers the gate's PASS/FAIL RULES, not just the list of
 # names it inspects. A rules change that left the stamp alone would inherit
 # every success earned under the old rules, because the sweep only re-evaluates
 # a SUCCESS whose stamp differs (#5851). Bump this whenever the meaning of a
 # passing gate changes.
-gate_rules='base-drift-v1'
+gate_rules='base-drift-v3'
 gate_contract=$(REQUIRED_JOBS="$required" GATE_RULES="$gate_rules" python3 -c 'import hashlib, os; print(hashlib.sha256((os.environ["REQUIRED_JOBS"] + "\n" + os.environ["GATE_RULES"]).encode()).hexdigest()[:12])')
 gate_stamp="[gate-contract:$gate_contract]"
+BASE_DRIFT_REMOTE=${BASE_DRIFT_REMOTE:-origin}
 repo_owner=${REPO%%/*}
 repo_name=${REPO#*/}
 # A green check set proves the BRANCH, not the merge. GitHub computes
@@ -176,50 +175,60 @@ repo_name=${REPO#*/}
 #
 # GitHub caps a comparison's `files` at 300. A truncated list cannot prove the
 # absence of an overlap, so it blocks too — the same branch update clears it.
-BASE_DRIFT_FILE_CAP=300
+# Refs this function fetches into. Namespaced so nothing else in the checkout
+# can be disturbed by an evaluation.
+BASE_DRIFT_MAIN_REF=refs/deploy-gate/main
+BASE_DRIFT_HEAD_REF=refs/deploy-gate/head
 drift_files=""
-base_drift_reason=""
 # Echoes the overlapping paths, or nothing when the head is safe to merge.
-# Returns non-zero only when GitHub could not answer, so the caller can leave
-# the gate pending instead of publishing a success it did not establish.
+# Returns non-zero only when the comparison could not be made, so the caller can
+# leave the gate pending instead of publishing a success it never established.
+#
+# This reads the two file sets with git, NOT the compare API. That endpoint caps
+# `files` at 300 and does not paginate past it, and `main` here moves ~577 files
+# in 90 commits — so the cap fired on 72 of 142 open PRs and published a verdict
+# about truncation rather than about drift. git has no such cap.
 base_drift() {
   local head="$1"
-  local head_cmp base_cmp merge_base cmp_status
+  local merge_base main_tip head_tip head_list main_list
   drift_files=""
-  base_drift_reason=""
-  head_cmp=$(gh_api_with_rate_limit_retry core \
-    "repos/$REPO/compare/main...$head?per_page=$BASE_DRIFT_FILE_CAP") || return $?
-  cmp_status=$(printf '%s\n' "$head_cmp" | jq -r '.status // empty')
-  # Read the status as an allow-list. A truncated or malformed body yields an
-  # empty string, and treating that as "not diverged" would publish a success
-  # this function never established.
-  case "$cmp_status" in
-    # Already contained in main: a push to main evaluates here too, and a commit
-    # cannot be stale against the branch that contains it.
-    behind | identical) return 0 ;;
-    # The merge base already is main's tip, so nothing has drifted under it.
-    ahead) return 0 ;;
-    diverged) ;;
-    *)
-      echo "::error::Unusable comparison status '$cmp_status' for $head" >&2
-      return 1
-      ;;
-  esac
-  merge_base=$(printf '%s\n' "$head_cmp" | jq -r '.merge_base_commit.sha // empty')
-  if ! [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]]; then
+  # Trees are needed, file contents never are, so filter the blobs out. The
+  # fetch is unauthenticated (the checkout runs with persist-credentials:false)
+  # which this public repo allows; a private fork would need a token here.
+  if ! git fetch --no-tags --quiet --filter=blob:none "$BASE_DRIFT_REMOTE" \
+    "+refs/heads/main:$BASE_DRIFT_MAIN_REF" "+$head:$BASE_DRIFT_HEAD_REF"; then
+    echo "::error::Could not fetch main and $head for the base-drift comparison" >&2
+    return 1
+  fi
+  main_tip=$(git rev-parse --verify --quiet "$BASE_DRIFT_MAIN_REF") || return 1
+  head_tip=$(git rev-parse --verify --quiet "$BASE_DRIFT_HEAD_REF") || return 1
+  if ! merge_base=$(git merge-base "$BASE_DRIFT_MAIN_REF" "$BASE_DRIFT_HEAD_REF"); then
     echo "::error::Could not resolve the merge base for $head" >&2
     return 1
   fi
-  base_cmp=$(gh_api_with_rate_limit_retry core \
-    "repos/$REPO/compare/$merge_base...main?per_page=$BASE_DRIFT_FILE_CAP") || return $?
-  if printf '%s\n' "$head_cmp" "$base_cmp" |
-    jq -se --argjson cap "$BASE_DRIFT_FILE_CAP" 'any(.[]; (.files | length) >= $cap)' >/dev/null; then
-    base_drift_reason="comparison truncated at $BASE_DRIFT_FILE_CAP files"
+  # A head contained in main — push-to-main evaluates here too — and a head
+  # whose merge base already is main's tip both have nothing above them.
+  if [ "$merge_base" = "$head_tip" ] || [ "$merge_base" = "$main_tip" ]; then
     return 0
   fi
-  drift_files=$(printf '%s\n' "$head_cmp" "$base_cmp" | jq -sr '
-    ([.[0].files[]?.filename] - ([.[0].files[]?.filename] - [.[1].files[]?.filename]))
-    | unique | join(",")')
+  head_list=$(mktemp "${RUNNER_TEMP:-/tmp}/deploy-gate-head.XXXXXX")
+  main_list=$(mktemp "${RUNNER_TEMP:-/tmp}/deploy-gate-main.XXXXXX")
+  # --no-renames, because rename detection is on by default and --name-only
+  # prints the POST-image path. If main renames a.ts to b.ts while the head
+  # edits a.ts, main's side lists only b.ts, the intersection comes out empty,
+  # and the gate publishes a success for a head that in fact collides — that
+  # pair conflicts on merge. Without detection the rename is a delete plus an
+  # add, so a.ts appears on both sides and the overlap is seen.
+  if ! git diff --name-only --no-renames "$merge_base" "$BASE_DRIFT_HEAD_REF" | sort -u > "$head_list" ||
+    ! git diff --name-only --no-renames "$merge_base" "$BASE_DRIFT_MAIN_REF" | sort -u > "$main_list"; then
+    rm -f "$head_list" "$main_list"
+    echo "::error::Could not list the changed files for $head" >&2
+    return 1
+  fi
+  # `grep -Fxf` exits 1 on no match, which under pipefail would read as an
+  # error; an empty intersection is the passing case, not a failure.
+  drift_files=$(grep -Fxf "$main_list" "$head_list" | paste -sd, - || true)
+  rm -f "$head_list" "$main_list"
   return 0
 }
 # GraphQL is the cheap rollup, but GitHub outages often 503 the
@@ -554,16 +563,30 @@ if ! base_drift "$SHA"; then
   return 0
 fi
 
-if [ -n "$base_drift_reason" ]; then
-  post_gate_status "failure" "Stale base ($base_drift_reason): update the branch"
-  active_sha=""
-  return 0
-fi
-
 if [ -n "$drift_files" ]; then
-  post_gate_status "failure" "Stale base: main changed $(name_count "$drift_files") file(s) here: $drift_files"
-  active_sha=""
-  return 0
+  # Squash and rebase merges do not retain the PR head's ancestry.
+  if ! merged_head=$(gh_api_with_rate_limit_retry core \
+    "repos/$REPO/commits/$SHA/pulls?per_page=100" --paginate --slurp |
+    jq -r --arg sha "$SHA" '
+      if type == "array" and length > 0 and all(.[];
+        type == "array" and all(.[];
+          (.head.sha | type) == "string" and
+          (.state == "open" or .state == "closed") and
+          (.merged_at == null or (.merged_at | type) == "string")))
+      then [.[][] | select(.head.sha == $sha)] as $prs |
+        (any($prs[]; .state == "closed" and .merged_at != null) and
+         (any($prs[]; .state == "open") | not))
+      else error("Incomplete associated pull-request response") end'); then
+    post_gate_status "pending" "Deploy Gate could not read associated PRs; retry scheduled"
+    active_sha=""
+    return 0
+  fi
+  if [ "$merged_head" != "true" ]; then
+    post_gate_status "failure" "Stale base: main changed $(name_count "$drift_files") file(s) here: $drift_files"
+    active_sha=""
+    return 0
+  fi
+  echo "Skipping base drift for merged PR head $SHA"
 fi
 
 post_gate_status "success" "All required PR gates passed"
@@ -578,6 +601,14 @@ case "${1:-}" in
     validate_sha
     [[ "${CHECK_ATTEMPTS:-2}" =~ ^[12]$ ]]
     evaluate_sha
+    ;;
+  # Answer the drift question for one head and nothing else. Useful on its own
+  # when a blocked PR needs explaining, and it lets the semantics behind
+  # `base_drift` be tested against a real repository with real SHAs.
+  drift)
+    validate_sha
+    base_drift "$SHA" || exit 1
+    printf '%s\n' "$drift_files"
     ;;
   *) echo "::error::Unknown Deploy Gate phase" >&2; exit 2 ;;
 esac

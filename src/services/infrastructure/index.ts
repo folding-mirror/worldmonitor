@@ -22,7 +22,7 @@ const statusBreaker = createCircuitBreaker<ListServiceStatusesResponse>({ name: 
 const ddosBreaker = createCircuitBreaker<ListInternetDdosAttacksResponse>({ name: 'DDoS Attacks', cacheTtlMs: 30 * 60 * 1000, persistCache: true });
 const trafficAnomaliesBreaker = createCircuitBreaker<ListInternetTrafficAnomaliesResponse>({ name: 'Traffic Anomalies', cacheTtlMs: 30 * 60 * 1000, persistCache: true });
 
-const emptyOutageFallback: ListInternetOutagesResponse = { outages: [], pagination: undefined };
+const emptyOutageFallback: ListInternetOutagesResponse = { outages: [], pagination: undefined, fetchedAt: 0 };
 const emptyStatusFallback: ListServiceStatusesResponse = { statuses: [] };
 const emptyDdosFallback: ListInternetDdosAttacksResponse = { protocol: [], vector: [], dateRangeStart: '', dateRangeEnd: '', topTargetLocations: [] };
 const emptyAnomaliesFallback: ListInternetTrafficAnomaliesResponse = { anomalies: [], totalCount: 0 };
@@ -86,6 +86,8 @@ function toOutage(proto: ProtoOutage): InternetOutage {
 // ========================================================================
 
 let outagesConfigured: boolean | null = null;
+/** Sticky proof that outage providers have returned real observations. */
+let outagesSeen = false;
 
 export function isOutagesConfigured(): boolean | null {
   return outagesConfigured;
@@ -104,25 +106,27 @@ export async function fetchInternetOutages(): Promise<InternetOutage[]> {
     resp = hydrated;
   } else {
     resp = await outageBreaker.execute(async () => {
-      const response = await client.listInternetOutages({
+      return await client.listInternetOutages({
         country: '',
         start: 0,
         end: 0,
         pageSize: 0,
         cursor: '',
       });
-      outagesConfigured = true;
-      return response;
     }, emptyOutageFallback);
   }
 
-  if (outageBreaker.getDataState().mode !== 'unavailable') outagesConfigured = true;
-  if (resp.outages.length === 0) {
-    return [];
+  if (resp.outages.length > 0) {
+    outagesSeen = true;
+    outagesConfigured = true;
+    return resp.outages.map(toOutage);
   }
 
-  outagesConfigured = true;
-  return resp.outages.map(toOutage);
+  // Empty snapshots must not imply missing configuration. Keep unknown until
+  // real observations arrive; once seen, retain/recover configured=true even
+  // across feature disablement so healthy empty cache can re-enable the layer.
+  outagesConfigured = outagesSeen ? true : null;
+  return [];
 }
 
 export function getOutagesStatus(): string {

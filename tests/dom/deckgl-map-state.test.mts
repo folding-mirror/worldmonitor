@@ -17,6 +17,12 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 
 import { initTestI18n } from './helpers/i18n.mts';
 
+const { listMilitaryBases } = vi.hoisted(() => ({ listMilitaryBases: vi.fn() }));
+vi.mock('@/services/generated-rpc-clients', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/services/generated-rpc-clients')>(),
+  MilitaryServiceClient: class { listMilitaryBases = listMilitaryBases; },
+}));
+
 type Handler = (event?: unknown) => void;
 type FlyToCall = { options: { center?: [number, number]; zoom?: number }; eventData?: Record<string, unknown> };
 
@@ -89,8 +95,10 @@ const { FakeMap, fakeMaps } = vi.hoisted(() => {
     setZoom(zoom: number): this { this.zoom = zoom; return this; }
     setCenter(center: [number, number]): this { this.center = { lng: center[0], lat: center[1] }; return this; }
     fitBounds(): this { return this; }
-    getBounds(): { getWest(): number; getSouth(): number; getEast(): number; getNorth(): number } {
-      return { getWest: () => -180, getSouth: () => -90, getEast: () => 180, getNorth: () => 90 };
+    getBounds() {
+      const { lat, lng } = this.center;
+      return { getWest: () => lng - 10, getSouth: () => lat - 10, getEast: () => lng + 10, getNorth: () => lat + 10,
+        getSouthWest: () => ({ lat: lat - 10, lng: lng - 10 }), getNorthEast: () => ({ lat: lat + 10, lng: lng + 10 }) };
     }
     project(): { x: number; y: number } { return { x: 0, y: 0 }; }
     unproject(): { lng: number; lat: number } { return { lng: 0, lat: 0 }; }
@@ -164,8 +172,8 @@ vi.mock('maplibre-gl', () => {
   return { default: namespace, ...namespace };
 });
 
-vi.mock('@deck.gl/mapbox', () => ({
-  MapboxOverlay: class {
+vi.mock('@deck.gl/maplibre', () => ({
+  MapLibreOverlay: class {
     props: Record<string, unknown>;
     constructor(props: Record<string, unknown>) { this.props = props; }
     setProps(props: Record<string, unknown>): void { Object.assign(this.props, props); }
@@ -268,6 +276,29 @@ async function mapWith(state?: DeckMapState): Promise<{ map: DeckGLMap; fake: In
   maps.push(created.map);
   return created;
 }
+
+describe('DeckGLMap Taiwan country clicks', () => {
+  it.each(['cii-choropleth-layer', 'resilience-choropleth-layer', 'happiness-choropleth-layer', null])(
+    'emits TW from legacy CN-TW in %s', async (layerId) => {
+      const { map } = await mapWith();
+      const openBrief = vi.fn();
+      map.setOnCountryClick(openBrief);
+      Reflect.set(map, 'hoveredCountryIso2', 'CN-TW');
+      Reflect.set(map, 'hoveredCountryName', 'Taiwan');
+
+      // Invoke the production picking handler; only the GPU picking result is synthetic.
+      Reflect.get(map, 'handleClick').call(map, {
+        coordinate: [121, 23.5],
+        layer: layerId ? { id: layerId } : null,
+        object: layerId ? { properties: { 'ISO3166-1-Alpha-2': 'CN-TW', name: 'Taiwan' } } : null,
+      });
+
+      expect(openBrief).toHaveBeenCalledExactlyOnceWith({
+        lat: 23.5, lon: 121, code: 'TW', name: 'Taiwan',
+      });
+    },
+  );
+});
 
 describe('DeckGLMap pendingCenter — eager center cache', () => {
   it('setView caches the preset centre and writes view and zoom synchronously', async () => {
@@ -407,5 +438,210 @@ describe('DeckGLMap state isolation', () => {
     snapshot.pan.x = 999;
     expect(map.getState().layers.hotspots).toBe(true);
     expect(map.getState().pan.x).toBe(10);
+  });
+});
+
+
+describe('DeckGLMap military base viewport commits', () => {
+  it('keeps the current viewport when older requests resolve last, and clears old coverage on failure', async () => {
+    const replies: ((value: unknown) => void)[] = [];
+    listMilitaryBases.mockImplementation(() => new Promise((resolve) => replies.push(resolve)));
+    const { map, fake } = await mapWith(initialState({ zoom: 5, layers: { ...allLayersOff(), bases: true } }));
+    fake.setZoom(5); fake.emit('moveend', {}); await vi.advanceTimersByTimeAsync(300);
+    const state = map as unknown as { serverBases: { id: string }[]; serverBaseClusters: unknown[]; serverBasesLoaded: boolean };
+    const result = (id: string) => ({ bases: [{ id, name: id, latitude: 20, longitude: 0 }], clusters: [], totalInView: 1, truncated: false });
+    expect(replies).toHaveLength(1);
+    fake.setCenter([40, 30]); fake.emit('moveend', {});
+    await vi.advanceTimersByTimeAsync(300);
+    expect(replies).toHaveLength(2);
+    replies[1]!(result('current'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.serverBases[0]?.id).toBe('current');
+    replies[0]!(result('old'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.serverBases[0]?.id).toBe('current');
+    listMilitaryBases.mockRejectedValueOnce(new Error('offline'));
+    fake.setCenter([80, 30]); fake.emit('moveend', {});
+    await vi.advanceTimersByTimeAsync(300);
+    expect(state.serverBases).toEqual([]);
+    expect(state.serverBaseClusters).toEqual([]);
+    expect(state.serverBasesLoaded).toBe(false);
+  });
+
+  it('does not commit a handler empty-200 as loaded coverage', async () => {
+    listMilitaryBases.mockResolvedValue({ bases: [], clusters: [], totalInView: 0, truncated: false });
+    const { map, fake } = await mapWith(initialState({ zoom: 4, layers: { ...allLayersOff(), bases: true } }));
+    fake.setCenter([12, -8]);
+    fake.setZoom(4);
+    fake.emit('moveend', {});
+    await vi.advanceTimersByTimeAsync(300);
+    const state = map as unknown as { serverBases: unknown[]; serverBaseClusters: unknown[]; serverBasesLoaded: boolean };
+    expect(state.serverBases).toEqual([]);
+    expect(state.serverBaseClusters).toEqual([]);
+    expect(state.serverBasesLoaded).toBe(false);
+  });
+
+  it('rejects a response during the debounce window and after layer disable', async () => {
+    let reply!: (value: unknown) => void;
+    listMilitaryBases.mockImplementation(() => new Promise((resolve) => { reply = resolve; }));
+    const { map, fake } = await mapWith(initialState({ zoom: 6, layers: { ...allLayersOff(), bases: true } }));
+    fake.setZoom(6); fake.emit('moveend', {}); await vi.advanceTimersByTimeAsync(300);
+    const state = map as unknown as { serverBases: unknown[] };
+    fake.setCenter([90, 40]);
+    reply({ bases: [{ id: 'stale' }], clusters: [], totalInView: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.serverBases).toEqual([]);
+    fake.emit('moveend', {}); await vi.advanceTimersByTimeAsync(300);
+    map.setLayers(allLayersOff());
+    reply({ bases: [{ id: 'disabled' }], clusters: [], totalInView: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.serverBases).toEqual([]);
+  });
+});
+
+it('fetches the current viewport when bases are enabled without another map movement', async () => {
+  listMilitaryBases.mockReset();
+  listMilitaryBases.mockResolvedValue({ bases: [{ id: 'enabled', name: 'enabled', latitude: 60, longitude: 110 }], clusters: [], totalInView: 1, truncated: false });
+  const { map, fake } = await mapWith(initialState({ layers: allLayersOff() }));
+  fake.setCenter([110, 60]); fake.setZoom(8); fake.emit('moveend', {});
+  await vi.advanceTimersByTimeAsync(300);
+  expect(listMilitaryBases).not.toHaveBeenCalled();
+  map.setLayers({ ...allLayersOff(), bases: true });
+  await vi.advanceTimersByTimeAsync(300);
+  expect(listMilitaryBases).toHaveBeenCalledTimes(1);
+  expect((map as unknown as { serverBases: { id: string }[] }).serverBases[0]?.id).toBe('enabled');
+});
+
+describe('DeckGLMap layer performance notice', () => {
+  const checkedToggles = (): HTMLInputElement[] => [...document.querySelectorAll<HTMLInputElement>('.deckgl-layer-toggles .layer-toggle input')]
+    .filter(input => input.checked);
+
+  // The full variant ships 13 default layers; a saved set can be larger. Neither
+  // is something the visitor just did, so neither may open the notice.
+  it('does not warn about the layers a visitor starts with, only about layers they add past the threshold', async () => {
+    const allOn = Object.fromEntries(Object.keys(DEFAULT_MAP_LAYERS).map(key => [key, true])) as unknown as MapLayers;
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const map = new DeckGLMap(container, initialState({ layers: allOn }), { chrome: true });
+    maps.push(map);
+    await map.whenReady();
+
+    expect(checkedToggles().length).toBeGreaterThan(14);
+    expect(document.querySelector('.layer-warn-overlay')).toBeNull();
+
+    const layer = checkedToggles().find(input => !input.closest('.layer-toggle-locked'));
+    if (!layer) throw new Error('no enabled layer to toggle');
+    layer.checked = false;
+    layer.dispatchEvent(new Event('change'));
+    expect(document.querySelector('.layer-warn-overlay')).toBeNull();
+    layer.checked = true;
+    layer.dispatchEvent(new Event('change'));
+
+    expect(document.querySelector('.layer-warn-overlay')).not.toBeNull();
+    await closeNotice();
+  });
+
+  // A bulk change (a preset, a shared link) moves the baseline without warning, so
+  // the next layer the visitor adds past the threshold still opens the notice.
+  it('rebases on bulk setLayers so the next added layer past the threshold still warns', async () => {
+    const allOn = Object.fromEntries(Object.keys(DEFAULT_MAP_LAYERS).map(key => [key, true])) as unknown as MapLayers;
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const map = new DeckGLMap(container, initialState({ layers: allOn }), { chrome: true });
+    maps.push(map);
+    await map.whenReady();
+
+    const keep = checkedToggles()
+      .filter(input => !input.closest('.layer-toggle-locked'))
+      .map(input => input.closest<HTMLElement>('.layer-toggle')!.dataset.layer!)
+      .filter(key => key !== 'ciiChoropleth' && key !== 'resilienceScore')
+      .slice(0, 13);
+    map.setLayers({ ...allLayersOff(), ...Object.fromEntries(keep.map(key => [key, true])) });
+    expect(checkedToggles()).toHaveLength(13);
+    expect(document.querySelector('.layer-warn-overlay')).toBeNull();
+
+    const added = [...document.querySelectorAll<HTMLInputElement>('.deckgl-layer-toggles .layer-toggle input')]
+      .find(input => !input.checked && !input.closest('.layer-toggle-locked'));
+    if (!added) throw new Error('no layer to add');
+    added.checked = true;
+    added.dispatchEvent(new Event('change'));
+
+    expect(document.querySelector('.layer-warn-overlay')).not.toBeNull();
+    await closeNotice();
+  });
+
+  // Layer search hides non-matching rows; they are still active layers.
+  it('counts layers hidden by an active search, so clearing the search and removing a layer never warns', async () => {
+    const allOn = Object.fromEntries(Object.keys(DEFAULT_MAP_LAYERS).map(key => [key, true])) as unknown as MapLayers;
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const map = new DeckGLMap(container, initialState({ layers: allOn }), { chrome: true });
+    maps.push(map);
+    await map.whenReady();
+
+    const search = document.querySelector<HTMLInputElement>('.deckgl-layer-toggles .layer-search');
+    if (!search) throw new Error('layer search missing');
+    search.value = 'nuclear';
+    search.dispatchEvent(new Event('input'));
+    map.setLayers(map.getState().layers);
+    search.value = '';
+    search.dispatchEvent(new Event('input'));
+
+    const layer = checkedToggles().find(input => !input.closest('.layer-toggle-locked'));
+    if (!layer) throw new Error('no enabled layer to toggle');
+    layer.checked = false;
+    layer.dispatchEvent(new Event('change'));
+
+    expect(document.querySelector('.layer-warn-overlay')).toBeNull();
+  });
+
+  // The notice module allows one dialog at a time and forgets it only after closing.
+  async function closeNotice(): Promise<void> {
+    document.querySelector<HTMLButtonElement>('.layer-warn-ok')?.click();
+    await vi.advanceTimersByTimeAsync(250);
+  }
+});
+
+
+describe('DeckGL renderer readiness and settlement', () => {
+  it('interrupts the previous move and settles only the current flight', async () => {
+    const { map, fake } = await mapWith();
+    map.setView('mena');
+    const firstFlight = fake.lastFlightGeneration();
+    const first = map.whenViewportSettled();
+    map.setCenter(41, 29, 6);
+    const second = map.whenViewportSettled();
+    await expect(first).resolves.toBe(false);
+    let settled = false;
+    void second.then(() => { settled = true; });
+    fake.emit('moveend', { [firstFlight.key]: firstFlight.generation });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    fake.settleLastFlight();
+    await expect(second).resolves.toBe(true);
+    expect(map.getCenter()).toEqual({ lat: 41, lon: 29 });
+  });
+
+  it.each([false, true])('defers chokepoint opens until ready (destroyed=%s)', async (destroyed) => {
+    let release!: () => void;
+    const host = Object.create(DeckGLMap.prototype);
+    const center = vi.fn();
+    const show = vi.fn();
+    Object.assign(host, {
+      destroyed: false, maplibreMap: null,
+      initPromise: new Promise<void>(resolve => { release = resolve; }),
+      setCenter: center, popup: { show }, getContainerCenter: () => ({ x: 20, y: 30 }),
+    });
+    host.openChokepoint('hormuz_strait');
+    expect(center).not.toHaveBeenCalled();
+    expect(show).not.toHaveBeenCalled();
+    host.maplibreMap = {};
+    host.destroyed = destroyed;
+    release();
+    await Promise.resolve();
+    expect(center).toHaveBeenCalledTimes(destroyed ? 0 : 1);
+    if (!destroyed) expect(center).toHaveBeenCalledWith(26.5, 56.5, 5);
+    expect(show).toHaveBeenCalledTimes(destroyed ? 0 : 1);
+    if (!destroyed) expect(show).toHaveBeenCalledWith(expect.objectContaining({ type: 'waterway', x: 20, y: 30 }));
   });
 });

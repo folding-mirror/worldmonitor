@@ -1,6 +1,7 @@
-import { unwrapEnvelope } from './seed-envelope';
-import { getRpcNoStoreReasonFromPayload } from './cache-contract';
-import { buildUpstreamEvent, getUsageScope, sendToAxiom } from './usage';
+import { COMPARE_AND_DELETE_SCRIPT } from '../../shared/compare-and-delete-script.cjs';
+import { unwrapEnvelope } from './seed-envelope.js';
+import { getRpcNoStoreReasonFromPayload } from './cache-contract.js';
+import { buildUpstreamEvent, getUsageScope, sendToAxiom } from './usage.js';
 
 // Default Upstash REST timeouts are tuned for production (Vercel ↔ Upstash
 // same-datacenter latency is sub-50ms, 1.5s leaves >20× headroom). They
@@ -79,7 +80,7 @@ async function readCachedJsonInternal(
 ): Promise<CacheReadResult> {
   if (process.env.LOCAL_API_MODE === 'tauri-sidecar') {
     try {
-      const { sidecarCacheGet } = await import('./sidecar-cache');
+      const { sidecarCacheGet } = await import('./sidecar-cache.js');
       const value = sidecarCacheGet(key);
       return value == null ? { status: 'miss' } : { status: 'hit', value };
     } catch (error) {
@@ -147,7 +148,7 @@ export function logCacheReadError(key: string, err: unknown): void {
  */
 export async function getRawJson(key: string): Promise<unknown | null> {
   if (process.env.LOCAL_API_MODE === 'tauri-sidecar') {
-    const { sidecarCacheGet } = await import('./sidecar-cache');
+    const { sidecarCacheGet } = await import('./sidecar-cache.js');
     return sidecarCacheGet(key);
   }
   const url = process.env.UPSTASH_REDIS_REST_URL;
@@ -173,7 +174,7 @@ export async function getRawJson(key: string): Promise<unknown | null> {
  */
 export async function getLargeRawJson(key: string, timeoutMs?: number): Promise<unknown | null> {
   if (process.env.LOCAL_API_MODE === 'tauri-sidecar') {
-    const { sidecarCacheGet } = await import('./sidecar-cache');
+    const { sidecarCacheGet } = await import('./sidecar-cache.js');
     return sidecarCacheGet(key);
   }
   const url = process.env.UPSTASH_REDIS_REST_URL;
@@ -208,7 +209,7 @@ export async function getLargeRawJson(key: string, timeoutMs?: number): Promise<
  */
 export async function getCachedRawString(key: string): Promise<string | null> {
   if (process.env.LOCAL_API_MODE === 'tauri-sidecar') {
-    const { sidecarCacheGet } = await import('./sidecar-cache');
+    const { sidecarCacheGet } = await import('./sidecar-cache.js');
     const v = sidecarCacheGet(key);
     return typeof v === 'string' ? v : null;
   }
@@ -251,7 +252,7 @@ export async function getCachedEnvelopeJson(key: string, raw = false): Promise<u
 
 export async function setCachedJson(key: string, value: unknown, ttlSeconds: number, raw = false): Promise<boolean> {
   if (process.env.LOCAL_API_MODE === 'tauri-sidecar') {
-    const { sidecarCacheSet } = await import('./sidecar-cache');
+    const { sidecarCacheSet } = await import('./sidecar-cache.js');
     return sidecarCacheSet(key, value, ttlSeconds);
   }
 
@@ -308,7 +309,7 @@ export async function setCachedJsonIfAbsent(
   onError?: (error: unknown) => void,
 ): Promise<boolean> {
   if (process.env.LOCAL_API_MODE === 'tauri-sidecar') {
-    const { sidecarCacheSetIfAbsent } = await import('./sidecar-cache');
+    const { sidecarCacheSetIfAbsent } = await import('./sidecar-cache.js');
     return sidecarCacheSetIfAbsent(key, value, ttlSeconds);
   }
 
@@ -355,7 +356,7 @@ export async function readCachedJsonList(
     : 1;
   if (process.env.LOCAL_API_MODE === 'tauri-sidecar') {
     try {
-      const { sidecarCacheGet } = await import('./sidecar-cache');
+      const { sidecarCacheGet } = await import('./sidecar-cache.js');
       const value = sidecarCacheGet(key);
       if (!Array.isArray(value) || value.length === 0) return { status: 'miss' };
       return { status: 'hit', value: value.slice(0, boundedLimit) };
@@ -442,7 +443,7 @@ export async function prependCachedJsonList(
 
   if (process.env.LOCAL_API_MODE === 'tauri-sidecar') {
     try {
-      const { sidecarCacheGet, sidecarCacheSet } = await import('./sidecar-cache');
+      const { sidecarCacheGet, sidecarCacheSet } = await import('./sidecar-cache.js');
       const existing = sidecarCacheGet(key);
       const retained = Array.isArray(existing)
         ? existing.filter((item) => JSON.stringify(item) !== encoded)
@@ -594,7 +595,7 @@ export async function getCachedJsonBatch(keys: string[], raw = false): Promise<M
 
   if (process.env.LOCAL_API_MODE === 'tauri-sidecar') {
     try {
-      const { sidecarCacheGet } = await import('./sidecar-cache');
+      const { sidecarCacheGet } = await import('./sidecar-cache.js');
       for (const key of keys) {
         const value = sidecarCacheGet(key);
         if (value != null) result.set(key, value);
@@ -781,7 +782,6 @@ export async function compareAndDeleteRedisKey(key: string, expectedValue: strin
   if (!url || !token || !expectedValue) return false;
 
   const finalKey = raw ? key : prefixKey(key);
-  const script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end";
   try {
     const response = await fetch(`${url}/`, {
       method: 'POST',
@@ -789,7 +789,7 @@ export async function compareAndDeleteRedisKey(key: string, expectedValue: strin
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(['EVAL', script, '1', finalKey, expectedValue]),
+      body: JSON.stringify(['EVAL', COMPARE_AND_DELETE_SCRIPT, '1', finalKey, expectedValue]),
       signal: AbortSignal.timeout(REDIS_PIPELINE_TIMEOUT_MS),
     });
     if (!response.ok) {

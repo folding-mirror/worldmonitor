@@ -2,12 +2,30 @@
 
 const { createHash } = require('node:crypto');
 const { Resend } = require('resend');
+const { appendUnsubscribeText, listUnsubscribeHeaders, unsubscribeUrlFor } = require('./lib/email-unsubscribe.cjs');
+const { sendResendEmail } = require('./lib/resend-send.cjs');
 const { decrypt } = require('./lib/crypto.cjs');
 const {
   assertNotificationWebhookDeliveryUrlSafe,
   postJsonWithPinnedAddress,
 } = require('./lib/notification-webhook-ssrf.cjs');
+const {
+  buildWebhookDeliveryHeaders,
+  resolveWebhookSigningSecret,
+} = require('./lib/notification-webhook-signing.cjs');
+const {
+  buildTeamsAlertPayload,
+  buildTeamsNoticePayload,
+  buildTeamsNoticePayloads,
+  sendTeamsPayload,
+} = require('./lib/notification-teams.cjs');
 const { callLLM } = require('./lib/llm-chain.cjs');
+const {
+  aiRoutingCacheSuffix,
+  allowedProvidersFor,
+  createAiRoutingPolicyResolver,
+} = require('./lib/ai-routing-policy.cjs');
+const { corroborationFromItemCount, corroborationText } = require('./lib/corroboration-text.cjs');
 const { fetchUserPreferences, extractUserContext, formatUserProfile } = require('./lib/user-context.cjs');
 const { countryNameToIso2 } = require('./shared/country-name-to-iso2.cjs');
 const ISO2_TO_REGION = require('./shared/iso2-to-region.json');
@@ -16,6 +34,10 @@ const {
   classifySetNxResult,
   recordDedupOutcome,
 } = require('./shared/notification-dedup.cjs');
+const {
+  parseSuppressionEntries,
+  isLinkSuppressed,
+} = require('./shared/notification-link-suppression.cjs');
 const {
   NOTIFY_DASHBOARD_URL,
   isImpersonatingSource,
@@ -41,6 +63,9 @@ const RELAY_SECRET = process.env.CONVEX_NOTIFICATION_RELAY_SECRET ?? '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY ?? '';
 const RESEND_FROM = process.env.RESEND_FROM_EMAIL ?? 'WorldMonitor <alerts@worldmonitor.app>';
+// AI impact text is built from one user's profile, so it honours that user's
+// AI routing policy (docs/internal/ai-routing-policy.md).
+const resolveAiRoutingPolicy = createAiRoutingPolicyResolver({ siteUrl: CONVEX_SITE_URL, secret: RELAY_SECRET });
 // When QUIET_HOURS_BATCH_ENABLED=0, treat batch_on_wake as critical_only.
 // Useful during relay rollout to disable queued batching before drainBatchOnWake is fully tested.
 const QUIET_HOURS_BATCH_ENABLED = process.env.QUIET_HOURS_BATCH_ENABLED !== '0';
@@ -75,9 +100,17 @@ async function fetchEnabledRules(enabled = true) {
 // ── Upstash REST helpers ──────────────────────────────────────────────────────
 
 async function upstashRest(...args) {
+  return upstashRequest(args);
+}
+
+// `signal` bounds one request (the re-queue write uses it so a stalled
+// Upstash call cannot hold the poll loop); the other callers keep the
+// unbounded legacy behaviour.
+async function upstashRequest(args, { signal } = {}) {
   const res = await fetch(`${UPSTASH_URL}/${args.map(encodeURIComponent).join('/')}`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'User-Agent': 'worldmonitor-relay/1.0' },
+    signal,
   });
   if (!res.ok) {
     console.warn(`[relay] Upstash error ${res.status} for command ${args[0]}`);
@@ -103,6 +136,152 @@ async function upstashDedupSetNx(key) {
 }
 
 // ── Dedup ─────────────────────────────────────────────────────────────────────
+
+// Operator link suppression (#8401). The set is maintained without a deploy:
+//
+//   SADD notif:blocked-links:v1 <exact-url>
+//   SADD notif:blocked-links:v1 host:<hostname>
+//
+// Consulted once per event in processEvent before any delivery, so a blocked
+// link stops every channel (email, Telegram, Slack, Discord, web push,
+// webhook) at once, and again per held event when a quiet-hours batch drains
+// (drainHeldForUser), so a link blocked while an event sat in the queue does
+// not ride out in the batch. The service worker consults the same
+// set via the edge read endpoint for already-delivered push payloads —
+// relay-side suppression alone cannot revoke those. Suppressed deliveries
+// are logged with the [relay][link-suppressed] prefix so the blast radius
+// of an incident can be measured afterwards.
+const BLOCKED_LINKS_KEY = 'notif:blocked-links:v1';
+const BLOCKED_LINKS_LOG_KEY = 'notif:link-suppressions:v1';
+const BLOCKED_LINKS_LOG_TTL = 30 * 24 * 3600; // 30 days — incident scoping, not cache
+const BLOCKED_LINKS_UNREADABLE_TTL_MS = 60 * 1000;
+// How long a last-known snapshot may stand in for an unreadable set. Within
+// it, an incident block survives a Redis blip; past it, the snapshot is
+// dropped (fail-open, per the contract above) with an error-level log rather
+// than silently enforcing — or silently un-enforcing — a list of unknown age.
+const BLOCKED_LINKS_SNAPSHOT_MAX_AGE_MS = 15 * 60 * 1000;
+
+let blockedLinksCache = { entries: null, fetchedAtMs: 0, snapshotAtMs: 0 };
+
+async function readBlockedLinkSet(fetchImpl = fetch) {
+  try {
+    const res = await fetchImpl(`${UPSTASH_URL}/SMEMBERS/${encodeURIComponent(BLOCKED_LINKS_KEY)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'User-Agent': 'worldmonitor-relay/1.0' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return { readable: false, entries: null };
+    const json = await res.json().catch(() => null);
+    const entries = json && Object.prototype.hasOwnProperty.call(json, 'result') ? json.result : undefined;
+    if (!Array.isArray(entries)) return { readable: false, entries: null };
+    return { readable: true, entries };
+  } catch {
+    return { readable: false, entries: null };
+  }
+}
+
+async function getBlockedLinkSet(fetchImpl = fetch) {
+  const nowMs = Date.now();
+  // Both positive snapshots AND negative (unreadable) outcomes are cached
+  // for the TTL window: entries!=null means we have a snapshot (possibly
+  // stale-but-usable), and fetchedAtMs!=0 means we attempted recently.
+  // Without the second condition a sustained outage would fire an SMEMBERS +
+  // warn per event under an event storm.
+  if ((blockedLinksCache.entries || blockedLinksCache.fetchedAtMs) && (nowMs - blockedLinksCache.fetchedAtMs) < BLOCKED_LINKS_UNREADABLE_TTL_MS) {
+    return blockedLinksCache;
+  }
+  const read = await readBlockedLinkSet(fetchImpl);
+  if (!read.readable) {
+    // Fail OPEN but not silent: keep the last known-good snapshot when we
+    // have one (an incident block survives a transient Redis blip), and
+    // tell the operator the control is currently unreadable. Stamp the
+    // attempt time so a sustained outage logs once per TTL window instead
+    // of firing an SMEMBERS + warn per event under an event storm.
+    const snapshotAgeMs = blockedLinksCache.entries ? nowMs - blockedLinksCache.snapshotAtMs : null;
+    if (snapshotAgeMs !== null && snapshotAgeMs > BLOCKED_LINKS_SNAPSHOT_MAX_AGE_MS) {
+      console.error(`[relay][link-suppressed-stale] blocked-link set unreadable and the last-known snapshot is ${Math.round(snapshotAgeMs / 1000)}s old (max ${BLOCKED_LINKS_SNAPSHOT_MAX_AGE_MS / 1000}s); dropping it and failing open until Redis is readable`);
+      blockedLinksCache = { entries: null, fetchedAtMs: nowMs, snapshotAtMs: 0, readable: false };
+      return blockedLinksCache;
+    }
+    blockedLinksCache = { ...blockedLinksCache, fetchedAtMs: nowMs, readable: false };
+    console.warn(snapshotAgeMs === null
+      ? '[relay][link-suppressed-unreadable] blocked-link set unreadable and no snapshot is held; failing open'
+      : `[relay][link-suppressed-unreadable] blocked-link set unreadable; continuing with last-known snapshot age=${Math.round(snapshotAgeMs / 1000)}s`);
+    return blockedLinksCache;
+  }
+  blockedLinksCache = { entries: read.entries, fetchedAtMs: nowMs, snapshotAtMs: nowMs, readable: true };
+  return blockedLinksCache;
+}
+
+function eventLinks(event) {
+  const links = [];
+  const link = event?.payload?.link;
+  const url = event?.payload?.url;
+  if (typeof link === 'string' && link.length > 0) links.push(link);
+  if (typeof url === 'string' && url.length > 0 && url !== link) links.push(url);
+  return links;
+}
+
+/**
+ * The links of `event` the operator set blocks, or [] when none are (or no
+ * snapshot is held — fail-open). Logs the [relay][link-suppressed] line and
+ * the incident record when something matched.
+ */
+async function suppressedLinksFor(event, matchedRuleCount, context) {
+  const links = eventLinks(event);
+  if (links.length === 0) return [];
+  const snapshot = await getBlockedLinkSet();
+  if (!snapshot.entries) return [];
+  const parsed = parseSuppressionEntries(snapshot.entries);
+  const suppressed = links.filter((l) => isLinkSuppressed(l, parsed));
+  if (suppressed.length === 0) return [];
+  const safeLinks = suppressed.map((l) => String(l).replace(/[\r\n]/g, ' ').slice(0, 200));
+  const safeType = String(event.eventType ?? 'unknown').replace(/[\r\n]/g, ' ').slice(0, 80);
+  console.log(`[relay][link-suppressed] ${context} eventType=${safeType} rules=${matchedRuleCount} links=${safeLinks.join(',')}`);
+  await logLinkSuppression(event, matchedRuleCount).catch(() => {});
+  return suppressed;
+}
+
+async function logLinkSuppression(event, matchedRuleCount, fetchImpl = fetch) {
+  const record = {
+    ts: Date.now(),
+    eventType: event?.eventType ?? 'unknown',
+    severity: event?.severity ?? 'high',
+    title: String(event?.payload?.title ?? event?.eventType ?? '').slice(0, 160),
+    source: typeof event?.payload?.source === 'string' ? event.payload.source.slice(0, 120) : '',
+    link: eventLinks(event).map((l) => String(l).slice(0, 500)),
+    matchedRules: matchedRuleCount,
+  };
+  const retentionCutoff = record.ts - BLOCKED_LINKS_LOG_TTL * 1000;
+  try {
+    const response = await fetchImpl(`${UPSTASH_URL}/pipeline`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${UPSTASH_TOKEN}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'worldmonitor-relay/1.0',
+      },
+      body: JSON.stringify([
+        ['ZADD', BLOCKED_LINKS_LOG_KEY, String(record.ts), JSON.stringify(record)],
+        ['ZREMRANGEBYSCORE', BLOCKED_LINKS_LOG_KEY, '-inf', String(retentionCutoff)],
+        ['EXPIRE', BLOCKED_LINKS_LOG_KEY, String(BLOCKED_LINKS_LOG_TTL)],
+      ]),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) {
+      console.warn('[relay][link-suppression-log-failed] suppression incident record returned a non-success response');
+      return;
+    }
+    const results = await response.json().catch(() => null);
+    if (!Array.isArray(results) || results.some((entry) => entry && typeof entry === 'object' && entry.error)) {
+      console.warn('[relay][link-suppression-log-failed] suppression incident record returned a command error');
+    }
+  } catch {
+    // Logging is best-effort — the suppression itself already happened —
+    // but failure must be visible so operators know incident scope is partial.
+    console.warn('[relay][link-suppression-log-failed] suppression incident record could not be written');
+  }
+}
 
 function sha256Hex(str) {
   return createHash('sha256').update(str).digest('hex');
@@ -228,11 +407,31 @@ function resolveQuietAction(rule, severity) {
 }
 
 const QUIET_HELD_TTL = 86400; // 24h — held events expire if never drained
+// Held queues are per user and fed by /api/notify, so they need a hard cap:
+// without one a single account could grow its list for a whole quiet window
+// and make the wake-up drain fetch and parse all of it in the shared relay.
+// The newest events win; a batch message never lists more than this anyway.
+const QUIET_HELD_MAX = 100;
 
 async function holdEvent(userId, variant, eventJson) {
   const key = `digest:quiet-held:${userId}:${variant}`;
   await upstashRest('RPUSH', key, eventJson);
+  await upstashRest('LTRIM', key, String(-QUIET_HELD_MAX), '-1');
   await upstashRest('EXPIRE', key, String(QUIET_HELD_TTL));
+}
+
+/**
+ * One line per held alert, shared by the text batch and the Teams card.
+ * Titles get the same boundary as formatMessage: held events include
+ * relay-originated ones that never passed /api/notify, so raw titles here
+ * would bypass the field guarantee (issue #8397). #9213: each line carries the
+ * story's coverage token when known.
+ */
+function formatHeldAlertLines(events) {
+  return events.map((ev) => {
+    const coverage = formatEventCoverage(ev);
+    return `[${String(ev.severity ?? 'high').toUpperCase()}] ${formatEventTitle(ev)}${coverage ? ` · ${coverage}` : ''}`;
+  });
 }
 
 // Delivers (or discards) the held queue for a single user+variant.
@@ -243,20 +442,20 @@ async function drainHeldForUser(userId, variant, allowedChannelTypes) {
   const len = await upstashRest('LLEN', key);
   if (!len || len === 0) return;
 
-  const items = await upstashRest('LRANGE', key, '0', '-1');
+  const items = await upstashRest('LRANGE', key, String(-QUIET_HELD_MAX), '-1');
   if (!Array.isArray(items) || items.length === 0) return;
 
-  const events = items.map(i => { try { return JSON.parse(i); } catch { return null; } }).filter(Boolean);
+  const parsedEvents = items.map(i => { try { return JSON.parse(i); } catch { return null; } }).filter(Boolean);
+  // Re-check the operator set: a link blocked while the event sat in the
+  // queue must not go out in the batch (#8401).
+  const events = [];
+  for (const ev of parsedEvents) {
+    if ((await suppressedLinksFor(ev, 1, 'stage=quiet-hours-drain')).length === 0) events.push(ev);
+  }
   if (events.length === 0) { await upstashRest('DEL', key); return; }
 
-  const lines = [`WorldMonitor — ${events.length} held alert${events.length !== 1 ? 's' : ''} from quiet hours`, ''];
-  for (const ev of events) {
-    // Shape held titles with the same boundary as formatMessage: held events
-    // include relay-originated ones that never passed /api/notify, so raw
-    // titles here would bypass the field guarantee (issue #8397).
-    const heldTitle = formatEventTitle(ev);
-    lines.push(`[${String(ev.severity ?? 'high').toUpperCase()}] ${heldTitle}`);
-  }
+  const heldLines = formatHeldAlertLines(events);
+  const lines = [`WorldMonitor — ${events.length} held alert${events.length !== 1 ? 's' : ''} from quiet hours`, '', ...heldLines];
   lines.push('', 'View full dashboard → worldmonitor.app');
   const text = lines.join('\n');
   const subject = `WorldMonitor — ${events.length} held alert${events.length !== 1 ? 's' : ''}`;
@@ -288,7 +487,13 @@ async function drainHeldForUser(userId, variant, allowedChannelTypes) {
       if (ch.channelType === 'telegram' && ch.chatId) ok = await sendTelegram(userId, ch.chatId, text);
       else if (ch.channelType === 'slack' && ch.webhookEnvelope) ok = await sendSlack(userId, ch.webhookEnvelope, text);
       else if (ch.channelType === 'discord' && ch.webhookEnvelope) ok = await sendDiscord(userId, ch.webhookEnvelope, text);
-      else if (ch.channelType === 'email' && ch.email) ok = await sendEmail(ch.email, subject, text);
+      else if (ch.channelType === 'teams' && ch.webhookEnvelope) ok = await sendTeamsCards(userId, ch.webhookEnvelope, buildTeamsNoticePayloads({
+        title: lines[0],
+        lines: heldLines,
+        link: NOTIFY_DASHBOARD_URL,
+        linkTitle: 'Open dashboard',
+      }));
+      else if (ch.channelType === 'email' && ch.email) ok = await sendEmail(ch.email, subject, text, unsubscribeUrlFor(ch, 'alerts'));
       else if (ch.channelType === 'webhook' && ch.webhookEnvelope) ok = await sendWebhook(userId, ch.webhookEnvelope, {
         eventType: 'quiet_hours_batch',
         severity: 'info',
@@ -305,14 +510,15 @@ async function drainHeldForUser(userId, variant, allowedChannelTypes) {
             title: formatEventTitle(ev),
             source: formatEventSource(ev),
             link: formatEventLinkForPush(ev),
+            ...(eventCorroboration(ev) ? { corroboration: eventCorroboration(ev) } : {}),
           })),
         },
-      });
+      }, ch.webhookSecret);
       else if (ch.channelType === 'web_push' && ch.endpoint && ch.p256dh && ch.auth) {
         ok = await sendWebPush(userId, ch, {
           title: `WorldMonitor · ${events.length} held alert${events.length === 1 ? '' : 's'}`,
           body: subject,
-          url: 'https://worldmonitor.app/',
+          url: PUSH_DASHBOARD_PATH,
           tag: `quiet_hours_batch:${userId}`,
           eventType: 'quiet_hours_batch',
         });
@@ -568,23 +774,76 @@ async function sendDiscord(userId, webhookEnvelope, text, retryCount = 0) {
   return true;
 }
 
-// ── Delivery: Email ───────────────────────────────────────────────────────────
+// ── Delivery: Microsoft Teams ─────────────────────────────────────────────────
 
-async function sendEmail(email, subject, text) {
-  if (!resend) { console.warn('[relay] RESEND_API_KEY not set — skipping email'); return false; }
+async function sendTeams(userId, webhookEnvelope, payload) {
+  let webhookUrl;
   try {
-    await resend.emails.send({ from: RESEND_FROM, to: email, subject, text });
-    return true;
+    webhookUrl = decrypt(webhookEnvelope);
   } catch (err) {
-    console.warn('[relay] Resend send failed:', err.message);
+    console.warn(`[relay] Teams decrypt failed for ${userId}:`, err.message);
     return false;
   }
+  const result = await sendTeamsPayload(webhookUrl, payload, { userAgent: 'worldmonitor-relay/1.0' });
+  if (result.gone) {
+    console.warn(`[relay] Teams workflow gone (${result.status}) for ${userId} — deactivating`);
+    await deactivateChannel(userId, 'teams');
+    return false;
+  }
+  if (!result.ok) {
+    console.warn(`[relay] Teams send failed for ${userId}: ${result.error}`);
+    return false;
+  }
+  console.log(`[relay] Teams delivered to ${userId}`);
+  return true;
 }
 
-async function sendWebhook(userId, webhookEnvelope, event) {
+/**
+ * Post every card of a split notice in order. Delivered only when all of
+ * them are: a partly delivered quiet-hours batch keeps its held queue, so a
+ * retry may repeat earlier cards but never drops an alert.
+ */
+async function sendTeamsCards(userId, webhookEnvelope, payloads) {
+  for (const payload of payloads) {
+    if (!(await sendTeams(userId, webhookEnvelope, payload))) return false;
+  }
+  return payloads.length > 0;
+}
+
+/** Adaptive Card for a realtime event, shaped by the same field helpers as the text sinks. */
+function buildTeamsAlertForEvent(event, impact) {
+  const rawCountry = event.payload?.countryCode ?? event.payload?.country ?? event.country;
+  return buildTeamsAlertPayload({
+    title: formatEventTitle(event),
+    severity: event.severity ?? 'high',
+    countryCode: typeof rawCountry === 'string' && rawCountry.trim() ? normalizeEventCountryCode(rawCountry) : null,
+    source: formatEventSource(event),
+    coverage: corroborationText(eventCorroboration(event)),
+    description: NOTIFY_RELAY_INCLUDE_SNIPPET ? truncateForDisplay(formatEventDescription(event), SNIPPET_TELEGRAM_MAX) : '',
+    link: event.payload?.link ?? event.payload?.url,
+    eventType: sanitizeNotificationTitle(event.eventType),
+    impact,
+  });
+}
+
+// ── Delivery: Email ───────────────────────────────────────────────────────────
+
+async function sendEmail(email, subject, text, unsubscribeUrl) {
+  const payload = { from: RESEND_FROM, to: email, subject, text };
+  if (unsubscribeUrl !== undefined) {
+    payload.text = appendUnsubscribeText(text, unsubscribeUrl, 'Unsubscribe from alert emails');
+    payload.headers = listUnsubscribeHeaders(unsubscribeUrl);
+  }
+  const result = await sendResendEmail(resend, payload, { logPrefix: '[relay]' });
+  return result.ok;
+}
+
+async function sendWebhook(userId, webhookEnvelope, event, webhookSecretEnvelope) {
   let url;
+  let signingSecret;
   try {
     url = decrypt(webhookEnvelope);
+    signingSecret = resolveWebhookSigningSecret(decrypt, webhookSecretEnvelope);
   } catch (err) {
     console.warn(`[relay] Webhook decrypt failed for ${userId}:`, err.message);
     return false;
@@ -618,7 +877,11 @@ async function sendWebhook(userId, webhookEnvelope, event) {
     const resp = await postJsonWithPinnedAddress(
       safeUrl,
       payload,
-      { 'Content-Type': 'application/json', 'User-Agent': 'worldmonitor-relay/1.0' },
+      {
+        'Content-Type': 'application/json',
+        'User-Agent': 'worldmonitor-relay/1.0',
+        ...buildWebhookDeliveryHeaders({ body: payload, eventType: event.eventType, secret: signingSecret }),
+      },
       resolvedAddresses,
     );
     if (resp.status === 404 || resp.status === 410 || resp.status === 403) {
@@ -683,6 +946,100 @@ function ensureVapidConfigured(client) {
   }
 }
 
+// Payload URLs originate from event.payload.link — published verbatim by Pro
+// accounts through /api/notify, or ingested verbatim from external RSS feeds.
+// Article links are the point of an rss_alert, so off-origin https targets
+// are kept; what must never happen is the service worker NAVIGATING the
+// user's already-open dashboard tab to one, which would replace a trusted
+// surface with a page WorldMonitor does not control. public/push-handler.js
+// owns that half: off-origin targets always get their own tab.
+//
+// The relay's half is scheme discipline — a javascript:, data: or http:
+// target must never be stored in a notification payload at all.
+// Resolution base ONLY — never returned. A relative base is not a legal base
+// (`new URL('/x', '/')` throws), so the sanitizer needs one absolute
+// first-party origin to parse against even though it emits none. This is the
+// single origin literal the push path is allowed to carry, and the
+// origin-literal pin below exempts it by name.
+const PUSH_PARSE_BASE = 'https://www.worldmonitor.app/';
+const PUSH_PARSE_BASE_ORIGIN = new URL(PUSH_PARSE_BASE).origin;
+
+// What we emit instead of an origin. Each service worker resolves this against
+// whichever host is serving it, so one payload works on www and on every
+// vertical subdomain.
+const PUSH_DASHBOARD_PATH = '/';
+
+// Generic aliases for "the dashboard", matched by EXACT hostname equality. The
+// vertical subdomains are deliberately absent: tech/finance/etc. are distinct
+// surfaces, so relativizing one would let another vertical's worker resolve it
+// onto itself and land the user on the wrong dashboard.
+const GENERIC_FIRST_PARTY_HOSTS = ['worldmonitor.app', 'www.worldmonitor.app'];
+
+// Paths Cloudflare serves on the apex (ARCHITECTURE.md §2). These must stay
+// absolute: relativizing /oauth/register destroys the apex origin before the
+// service worker — which can only recognize an ABSOLUTE apex URL — ever gets a
+// say, and a www redirect turns a registration POST into a GET (405, #4938).
+const APEX_SERVED_PATHS = [
+  /^\/mcp(?:\/|$)/,
+  /^\/oauth\//,
+  /^\/\.well-known\//,
+  /^\/robots\.txt$/,
+  /^\/security\.txt$/,
+  /^\/auth\.md$/,
+];
+
+function safePushClickUrl(raw, userId) {
+  // A missing link is ordinary traffic on every plain brief_ready push, not a
+  // rejection — logging it would be noise.
+  if (typeof raw !== 'string' || raw.length === 0) return PUSH_DASHBOARD_PATH;
+
+  const reject = (reason) => {
+    console.warn(`[relay] push click URL rejected for ${userId ?? 'unknown'}: ${reason}`);
+    return PUSH_DASHBOARD_PATH;
+  };
+
+  let parsed;
+  try {
+    parsed = new URL(raw, PUSH_PARSE_BASE);
+  } catch (err) {
+    return reject(`unparseable (${err.message})`);
+  }
+  if (parsed.protocol !== 'https:') return reject(`scheme ${parsed.protocol}`);
+  // Embedded credentials exist only to make a hostile host read as ours.
+  if (parsed.username || parsed.password) return reject('embedded credentials');
+
+  // Off-origin articles and vertical-subdomain targets stay absolute: the
+  // worker gives them their own tab, which is the point of an rss_alert.
+  if (!GENERIC_FIRST_PARTY_HOSTS.includes(parsed.hostname)) return parsed.href;
+  if (APEX_SERVED_PATHS.some((re) => re.test(parsed.pathname))) return parsed.href;
+
+  const relative = parsed.pathname + parsed.search + parsed.hash;
+  // Detaching a path from its origin is where this gets dangerous: a URL can be
+  // first-party BY HOST and still have a pathname of //evil.com, which resolves
+  // straight back off-origin. Both laundering spellings arrive here as that
+  // same pathname, because the parser normalizes a backslash to a slash. We
+  // re-resolve and compare origins rather than testing the string's shape,
+  // because that is robust to ANY pathname the parser can produce — including
+  // authority-shaped ones a prefix test would have to enumerate.
+  let resolved;
+  try {
+    resolved = new URL(relative, PUSH_PARSE_BASE);
+  } catch {
+    return reject('path did not survive relativization');
+  }
+  if (resolved.origin !== PUSH_PARSE_BASE_ORIGIN) {
+    return reject('first-party host with an off-origin path');
+  }
+  // Return the RE-RESOLVED path, not the string we validated. They differ when
+  // the pathname is itself authority-shaped: '//www.worldmonitor.app/x' passes
+  // the origin check (it resolves back to us) but, handed to a worker on a
+  // vertical subdomain, re-resolves to www and pins the click off that
+  // worker's own origin — re-admitting the very coupling this emits relative
+  // paths to avoid. public/push-handler.js returns resolved.href for the same
+  // reason.
+  return resolved.pathname + resolved.search + resolved.hash;
+}
+
 /**
  * Deliver a web push notification to one subscription. Returns true on
  * success. On 404/410 (subscription gone) the channel is deactivated
@@ -700,7 +1057,7 @@ async function sendWebPush(userId, subscription, payload) {
   const body = JSON.stringify({
     title: payload.title || 'WorldMonitor',
     body: payload.body || '',
-    url: payload.url || 'https://worldmonitor.app/',
+    url: safePushClickUrl(payload.url, userId),
     tag: payload.tag || 'worldmonitor-generic',
     eventType: payload.eventType,
   });
@@ -769,12 +1126,15 @@ function normalizeEventCountryCode(raw) {
 //    via event.userId.
 //  - watchlist_story_alert: scoped by ticker (eventMatchesTickerScope), not
 //    by country — an explicit per-rule opt-in that country scope must not veto.
+//  - chokepoint_disruption: same reasoning, scoped by chokepoint
+//    (eventMatchesChokepointScope) and opt-in only (#9217).
 const PERMISSIVE_UNATTRIBUTED_EVENT_TYPES = new Set([
   'rss_alert',
   'keyword_spike',
   'hotspot_escalation',
   'military_surge',
   'watchlist_story_alert',
+  'chokepoint_disruption',
 ]);
 
 function isPermissiveUnattributedEvent(event) {
@@ -874,6 +1234,7 @@ function eventMatchesCountryScope(event, rule) {
 // ── Watchlist story alerts (#4922 item e / U3) ───────────────────────────────
 
 const WATCHLIST_STORY_EVENT_TYPE = 'watchlist_story_alert';
+const CHOKEPOINT_DISRUPTION_EVENT_TYPE = 'chokepoint_disruption';
 
 /**
  * Per-rule eventTypes gate, extracted from the inline matching expression so
@@ -896,7 +1257,13 @@ function ruleMatchesEventType(rule, event) {
   if (event?.eventType === WATCHLIST_STORY_EVENT_TYPE) {
     return rule.eventTypes.includes(WATCHLIST_STORY_EVENT_TYPE);
   }
-  const broadcastTypes = rule.eventTypes.filter((t) => t !== WATCHLIST_STORY_EVENT_TYPE);
+  // Same opt-in contract as the watchlist row (#9217): a wildcard rule never
+  // receives it, and opting in does not narrow the rule's other alerts.
+  if (event?.eventType === CHOKEPOINT_DISRUPTION_EVENT_TYPE) {
+    return rule.eventTypes.includes(CHOKEPOINT_DISRUPTION_EVENT_TYPE);
+  }
+  const broadcastTypes = rule.eventTypes.filter((t) => t !== WATCHLIST_STORY_EVENT_TYPE)
+    .filter((t) => t !== CHOKEPOINT_DISRUPTION_EVENT_TYPE);
   return broadcastTypes.length === 0 || broadcastTypes.includes(event.eventType);
 }
 
@@ -924,6 +1291,31 @@ function eventMatchesTickerScope(event, rule) {
   if (eventTickers.length === 0) return false;
   const ruleSet = new Set(rule.tickers.map((t) => String(t).toUpperCase()));
   return eventTickers.some((t) => ruleSet.has(String(t).toUpperCase()));
+}
+
+/**
+ * Narrows `chokepoint_disruption` to the rule's chokepoints. Unlike tickers,
+ * an empty/absent list means every chokepoint: the eventTypes opt-in already
+ * makes the event explicit, and "alert me on any chokepoint" is the common
+ * choice. Every other event type passes through untouched.
+ */
+function eventMatchesChokepointScope(event, rule) {
+  if (event?.eventType !== CHOKEPOINT_DISRUPTION_EVENT_TYPE) return true;
+  if (!Array.isArray(rule.chokepoints) || rule.chokepoints.length === 0) return true;
+  const chokepointId = event?.payload?.chokepointId;
+  return typeof chokepointId === 'string' && rule.chokepoints.includes(chokepointId);
+}
+
+/**
+ * Web push tag: a later push with the same tag replaces the earlier one in the
+ * tray. Chokepoint alerts carry the chokepoint so two crossings in one tick
+ * both stay visible.
+ */
+function webPushTagFor(event, userId) {
+  const chokepointId = event?.eventType === CHOKEPOINT_DISRUPTION_EVENT_TYPE ? event?.payload?.chokepointId : null;
+  return typeof chokepointId === 'string' && chokepointId
+    ? `${event.eventType}:${chokepointId}:${userId}`
+    : `${event.eventType}:${userId}`;
 }
 
 function shouldNotify(rule, event) {
@@ -1004,10 +1396,40 @@ function formatMessage(event) {
     if (snippet) parts.push(`> ${truncateForDisplay(snippet, SNIPPET_TELEGRAM_MAX)}`);
   }
   const source = formatEventSource(event);
-  if (source) parts.push(`Source: ${source}`);
+  const coverage = formatEventCoverage(event);
+  if (source) parts.push(`Source: ${source}${coverage ? ` · ${coverage}` : ''}`);
+  else if (coverage) parts.push(coverage);
   const link = formatEventLinkForText(event);
   if (link) parts.push(link);
   return parts.join('\n');
+}
+
+/**
+ * #9213: the story's corroboration, as assessCorroboration gives a digest item
+ * with this publisher count, or null when unknown. Only relay-originated
+ * events carry a count: /api/notify strips it from caller-submitted events,
+ * and a caller cannot claim coverage, so those are always null.
+ */
+function eventCorroboration(event) {
+  if (event.userId) return null;
+  return corroborationFromItemCount(event.payload?.corroborationCount);
+}
+
+/**
+ * The one token every text channel shows, e.g. "Coverage: single publisher".
+ * Coverage, not accuracy: it counts publishers and never says a claim is true.
+ */
+function formatEventCoverage(event) {
+  const text = corroborationText(eventCorroboration(event));
+  return text ? `Coverage: ${text}` : '';
+}
+
+/** Web push body: the message's first line after the title, with the coverage token. */
+function formatPushBody(deliveryText, event) {
+  const firstLine = (deliveryText || '').split('\n')[1] || '';
+  const coverage = formatEventCoverage(event);
+  if (!coverage || firstLine.includes(coverage)) return firstLine;
+  return firstLine ? `${firstLine} · ${coverage}` : coverage;
 }
 
 /**
@@ -1086,6 +1508,10 @@ function shapeEventForWebhook(event) {
   if (payload.url !== undefined) payload.url = link;
   const description = formatEventDescription(event);
   if (description) payload.description = description; else delete payload.description;
+  // #9213: the verdict as a stable field, derived here from the count, never
+  // forwarded from the caller's payload.
+  const corroboration = eventCorroboration(event);
+  if (corroboration) payload.corroboration = corroboration; else delete payload.corroboration;
   return { ...event, payload };
 }
 
@@ -1143,6 +1569,13 @@ async function processWelcome(event) {
     await sendSlack(userId, ch.webhookEnvelope, text);
   } else if (channelType === 'discord' && ch.webhookEnvelope) {
     await sendDiscord(userId, ch.webhookEnvelope, text);
+  } else if (channelType === 'teams' && ch.webhookEnvelope) {
+    await sendTeams(userId, ch.webhookEnvelope, buildTeamsNoticePayload({
+      title: '✅ WorldMonitor connected',
+      lines: ["You'll receive alerts here when events match your alert rules."],
+      link: NOTIFY_DASHBOARD_URL,
+      linkTitle: 'Open WorldMonitor',
+    }));
   } else if (channelType === 'email' && ch.email) {
     await sendEmail(ch.email, 'WorldMonitor Notifications Connected', text);
   } else if (channelType === 'web_push' && ch.endpoint && ch.p256dh && ch.auth) {
@@ -1155,7 +1588,7 @@ async function processWelcome(event) {
     await sendWebPush(userId, ch, {
       title: 'WorldMonitor connected',
       body: "You'll receive alerts here when events match your sensitivity settings.",
-      url: 'https://worldmonitor.app/',
+      url: PUSH_DASHBOARD_PATH,
       tag: `channel_welcome:${userId}`,
       eventType: 'channel_welcome',
     });
@@ -1245,7 +1678,8 @@ async function generateEventImpact(event, rule) {
   const variant = rule.variant ?? 'full';
   const eventHash = sha256Hex(`${event.eventType}:${event.payload?.title ?? ''}`);
   const ctxHash = sha256Hex(JSON.stringify({ ...ctx, variant })).slice(0, 16);
-  const cacheKey = `impact:ai:v1:${eventHash.slice(0, 16)}:${ctxHash}`;
+  const aiRouting = await resolveAiRoutingPolicy(rule.userId);
+  const cacheKey = `impact:ai:v1:${eventHash.slice(0, 16)}:${ctxHash}${aiRoutingCacheSuffix(aiRouting)}`;
 
   try {
     const cached = await upstashRest('GET', cacheKey);
@@ -1272,7 +1706,12 @@ ${profile}`;
   let impact;
   try {
     impact = await Promise.race([
-      callLLM(systemPrompt, userPrompt, { maxTokens: 200, temperature: 0.2, timeoutMs: 8000 }),
+      callLLM(systemPrompt, userPrompt, {
+        maxTokens: 200,
+        temperature: 0.2,
+        timeoutMs: 8000,
+        allowedProviders: allowedProvidersFor(aiRouting),
+      }),
       new Promise((_, reject) => setTimeout(() => reject(new Error('global timeout')), 10000)),
     ]);
   } catch {
@@ -1289,10 +1728,52 @@ ${profile}`;
   return impact;
 }
 
+// A rules-read failure used to drop the event on the floor. The read is shared
+// across every tenant (one Convex transaction over every enabled rule), so a
+// transient failure there — a Convex blip, or the read limit tripped by an
+// oversized row before the shape bounds existed — silently lost alerts for
+// everyone. Now the event goes back on the queue (LPUSH = behind everything
+// already queued; the loop RPOPs from the tail) with an attempt counter, and
+// the relay backs off so an outage does not spin. After the last attempt the
+// drop is logged loudly instead of quietly.
+const RULES_FETCH_RETRY_MAX = 5;
+const RULES_FETCH_RETRY_BACKOFF_MS = 2000;
+const RULES_FETCH_RETRY_BACKOFF_MAX_MS = 10000;
+// Same 10 s policy as the relay's Convex calls: a stalled re-queue write is a
+// re-queue failure, not a blocked poll loop.
+const REQUEUE_UPSTASH_TIMEOUT_MS = 10000;
+
+async function requeueAfterRulesFailure(event, err) {
+  const attempts = (Number.isInteger(event.rulesFetchAttempts) ? event.rulesFetchAttempts : 0) + 1;
+  if (attempts > RULES_FETCH_RETRY_MAX) {
+    console.error(`[relay] Dropping ${event.eventType} after ${RULES_FETCH_RETRY_MAX} alert-rules fetch failures:`, err.message);
+    return false;
+  }
+  let requeued = null;
+  try {
+    requeued = await upstashRequest(
+      ['LPUSH', EVENT_QUEUE_KEY, JSON.stringify({ ...event, rulesFetchAttempts: attempts })],
+      { signal: AbortSignal.timeout(REQUEUE_UPSTASH_TIMEOUT_MS) },
+    );
+  } catch (requeueErr) {
+    console.error(`[relay] Failed to fetch alert rules and the re-queue of ${event.eventType} failed (${requeueErr.message}) — dropped:`, err.message);
+    return false;
+  }
+  if (requeued === null) {
+    console.error(`[relay] Failed to fetch alert rules and could not re-queue ${event.eventType} — dropped:`, err.message);
+    return false;
+  }
+  console.warn(`[relay] Failed to fetch alert rules (attempt ${attempts}/${RULES_FETCH_RETRY_MAX}); re-queued ${event.eventType}:`, err.message);
+  await new Promise(r => setTimeout(r, Math.min(RULES_FETCH_RETRY_BACKOFF_MS * attempts, RULES_FETCH_RETRY_BACKOFF_MAX_MS)));
+  return true;
+}
+
 async function processEvent(event) {
   if (event.eventType === 'channel_welcome') { await processWelcome(event); return; }
   if (event.eventType === 'flush_quiet_held') { await processFlushQuietHeld(event); return; }
-  console.log(`[relay] Processing event: ${event.eventType} (${event.severity ?? 'high'})`);
+  const eventLog = JSON.stringify({ eventType: event.eventType, severity: event.severity ?? 'high' })
+    .replace(/[\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/g, ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`);
+  console.log('[relay] Processing event:', eventLog);
 
   // Shadow log importanceScore for comparison. Gate at caller: only rss_alert
   // events carry importanceScore; for everything else shadowLogScore would
@@ -1316,7 +1797,7 @@ async function processEvent(event) {
   try {
     enabledRules = await fetchEnabledRules(true);
   } catch (err) {
-    console.error('[relay] Failed to fetch alert rules:', err.message);
+    await requeueAfterRulesFailure(event, err);
     return;
   }
 
@@ -1331,6 +1812,7 @@ async function processEvent(event) {
     shouldNotify(r, event) &&
     eventMatchesCountryScope(event, r) &&
     eventMatchesTickerScope(event, r) &&
+    eventMatchesChokepointScope(event, r) &&
     (!event.variant || !r.variant || r.variant === event.variant) &&
     (!event.userId || r.userId === event.userId)
   );
@@ -1345,6 +1827,7 @@ async function processEvent(event) {
     shouldNotify(r, event) &&
     !eventMatchesCountryScope(event, r) &&
     eventMatchesTickerScope(event, r) &&
+    eventMatchesChokepointScope(event, r) &&
     (!event.variant || !r.variant || r.variant === event.variant) &&
     (!event.userId || r.userId === event.userId)
   ).length;
@@ -1352,6 +1835,16 @@ async function processEvent(event) {
     const rawAttribution = event?.payload?.countryCode ?? event?.payload?.country ?? event?.country ?? '(unattributed)';
     const attribution = String(rawAttribution).replace(/[\r\n]/g, ' ').slice(0, 60);
     console.log(`[relay] Country-scope drop: ${event.eventType} attribution=${attribution} excluded ${countryScopeDrops} scoped rule(s)`);
+  }
+
+  // Operator link suppression (#8401): consult the blocked set BEFORE any
+  // delivery so one check covers every channel. Fail-open on read errors —
+  // the set is a revoke control, not an auth gate, and a Redis blip must not
+  // blank notifications — but never silent: unreadable reads log loudly.
+  // Suppression count is derived from the pre-PRO rule match so the log line
+  // scopes the incident even when some rules would later drop on entitlement.
+  if (matching.length > 0 && (await suppressedLinksFor(event, matching.length, 'stage=deliver')).length > 0) {
+    return;
   }
 
   if (matching.length === 0) return;
@@ -1443,9 +1936,13 @@ async function processEvent(event) {
     if (verifiedChannels.length === 0) continue;
 
     let deliveryText = text;
+    let impactText = '';
     if (AI_IMPACT_ENABLED) {
       const impact = sanitizeImpactText(await generateEventImpact(event, rule));
-      if (impact) deliveryText = `${text}\n\n— Impact —\n${impact}`;
+      if (impact) {
+        impactText = impact;
+        deliveryText = `${text}\n\n— Impact —\n${impact}`;
+      }
     }
 
     for (const ch of verifiedChannels) {
@@ -1456,10 +1953,12 @@ async function processEvent(event) {
           await sendSlack(rule.userId, ch.webhookEnvelope, deliveryText);
         } else if (ch.channelType === 'discord' && ch.webhookEnvelope) {
           await sendDiscord(rule.userId, ch.webhookEnvelope, deliveryText);
+        } else if (ch.channelType === 'teams' && ch.webhookEnvelope) {
+          await sendTeams(rule.userId, ch.webhookEnvelope, buildTeamsAlertForEvent(event, impactText));
         } else if (ch.channelType === 'email' && ch.email) {
-          await sendEmail(ch.email, subject, deliveryText);
+          await sendEmail(ch.email, subject, deliveryText, unsubscribeUrlFor(ch, 'alerts'));
         } else if (ch.channelType === 'webhook' && ch.webhookEnvelope) {
-          await sendWebhook(rule.userId, ch.webhookEnvelope, shapeEventForWebhook(event));
+          await sendWebhook(rule.userId, ch.webhookEnvelope, shapeEventForWebhook(event), ch.webhookSecret);
         } else if (ch.channelType === 'web_push' && ch.endpoint && ch.p256dh && ch.auth) {
           // Web push carries short payloads (Chrome caps at ~4KB and
           // auto-truncates longer ones anyway). Use title + first line
@@ -1469,12 +1968,11 @@ async function processEvent(event) {
           // (review finding: raw title/link bypassed the new sanitizers;
           // `payload.url` is a second, edge-unvalidated link field, so the
           // link wins and url is only a fallback before classification).
-          const firstLine = (deliveryText || '').split('\n')[1] || '';
           await sendWebPush(rule.userId, ch, {
             title: formatEventTitle(event, 'WorldMonitor'),
-            body: firstLine,
+            body: formatPushBody(deliveryText, event),
             url: formatEventLinkForPush(event),
-            tag: `${event.eventType}:${rule.userId}`,
+            tag: webPushTagFor(event, rule.userId),
             eventType: event.eventType,
           });
         }
@@ -1558,15 +2056,35 @@ if (require.main === module) {
 
 module.exports = {
   processEvent,
+  // Exported so the AI routing policy suite drives the real impact path.
+  generateEventImpact,
+  safePushClickUrl,
   sendTelegram,
+  // Exported so the signing suite drives the real delivery path.
+  sendWebhook,
   checkDedup,
   upstashDedupSetNx,
   eventMatchesCountryScope,
+  // Exported for tests: the link-suppression suite drives the real helpers
+  // (not mirrors) so matcher drift fails the suite instead of the incident.
+  eventLinks,
+  readBlockedLinkSet,
+  getBlockedLinkSet,
+  logLinkSuppression,
+  BLOCKED_LINKS_KEY,
+  BLOCKED_LINKS_LOG_KEY,
+  BLOCKED_LINKS_SNAPSHOT_MAX_AGE_MS,
+  __resetBlockedLinkCacheForTests: () => { blockedLinksCache = { entries: null, fetchedAtMs: 0, snapshotAtMs: 0 }; },
   // Exported for the same reason as eventMatchesCountryScope: the ticker-scope
   // tests previously kept hand-copied mirrors of these, which cannot fail when
   // the real ones change.
   eventMatchesTickerScope,
+  eventMatchesChokepointScope,
+  webPushTagFor,
   ruleMatchesEventType,
+  // Exported so the effective-sensitivity coercion and the importance-score
+  // threshold ladder are exercised directly rather than grepped from source.
+  shouldNotify,
   // Exported for the same reason as eventMatchesCountryScope: the
   // notify-field-validation tests must exercise the real formatter, not a
   // hand-copied mirror that cannot fail when the real one changes.
@@ -1577,12 +2095,23 @@ module.exports = {
   formatEventDescription,
   formatEventLinkForText,
   formatEventLinkForPush,
+  formatEventCoverage,
+  formatPushBody,
   shapeEventForWebhook,
   sanitizeImpactText,
   escapeSlackText,
   escapeDiscordText,
   buildSlackMessagePayload,
   buildDiscordMessagePayload,
+  buildTeamsAlertForEvent,
+  formatHeldAlertLines,
+  sendTeams,
   processWelcome,
   popNextEvent,
+  holdEvent,
+  QUIET_HELD_MAX,
+  // Exported so the re-queue suite drives the real retry path.
+  requeueAfterRulesFailure,
+  RULES_FETCH_RETRY_MAX,
+  EVENT_QUEUE_KEY,
 };

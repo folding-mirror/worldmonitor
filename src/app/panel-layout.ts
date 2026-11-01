@@ -1,4 +1,7 @@
+import { clearTelegramIntelCache } from '@/services/telegram-intel';
+import { subscribeRuntimeConfig } from '@/services/runtime-config';
 import type { AppContext, AppModule } from '@/app/app-context';
+import type { LoadAllDataTrigger } from '@/app/viewport-hydration-ledger';
 import { CORRELATION_DOMAINS } from '@/types/correlation';
 import type { CorrelationPanel } from '@/components/CorrelationPanel';
 import { normalizeExclusiveChoropleths } from '@/components/resilience-choropleth-utils';
@@ -46,7 +49,7 @@ import { BETA_MODE } from '@/config/beta';
 import { NQ_PULSE_DISCLOSURE } from '@/config/nq-context';
 import { t } from '@/services/i18n';
 import { getCurrentTheme } from '@/utils';
-import { trackCriticalBannerAction, trackCheckoutSuccess, trackCheckoutFailed, trackGateHit, trackMapViewChange, replayPendingCheckoutSuccess, replayPendingProFunnelEvents, replayPendingConversionEvents, replayPendingMissionReturn } from '@/services/analytics';
+import { trackCriticalBannerAction, trackCheckoutSuccess, trackCheckoutFailed, trackGateHit, trackMapViewChange, trackLayoutCustomized, replayPendingCheckoutSuccess, replayPendingProFunnelEvents, replayPendingConversionEvents, replayPendingMissionReturn } from '@/services/analytics';
 import { ProPreviewSection } from '@/components/ProPreviewSection';
 import { syncPanelPreview } from '@/services/mission-preview-registry';
 import { loadStoredMissionPreset } from '@/services/mission-presets';
@@ -125,6 +128,7 @@ import type { Panel } from '@/components/Panel';
 import type { SupplyChainPanel } from '@/components/SupplyChainPanel';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
 import { loadPanelCollapsed, loadPanelColSpans, loadPanelSpans } from '@/utils/panel-storage';
+import { registerSettingsExportFlush } from '@/utils/settings-persistence';
 import { measure, mutate } from '@/utils/layout-batch';
 import { applyPanelFontScale } from '@/services/font-scale-settings';
 import {
@@ -418,10 +422,11 @@ export interface PanelLayoutManagerCallbacks {
   openCountryStory: (code: string, name: string) => void;
   openCountryBrief: (code: string) => void;
   openSearch: () => void;
-  loadAllData: (forceAll?: boolean) => Promise<void>;
+  loadAllData: (forceAll?: boolean, trigger?: LoadAllDataTrigger) => Promise<void>;
   primeVisiblePanelData: () => void;
   updateMonitorResults: () => void;
   loadSecurityAdvisories?: () => Promise<void>;
+  loadTelegramIntel?: () => Promise<void>;
   applyMapLayerChange?: (layer: keyof MapLayers, enabled: boolean, source: 'programmatic') => void;
   isFreeTierFallbackActive?: () => boolean;
 }
@@ -463,8 +468,10 @@ export class PanelLayoutManager implements AppModule {
   private mobileMapCollapseBtn: HTMLButtonElement | null = null;
   private panelTabBar: PanelTabBar | null = null;
   private tabsState: TabsState | null = null;
+  private unregisterExportFlush: (() => void) | null = null;
   private aviationCommandBar: AviationCommandBar | null = null;
   private readonly applyTimeRangeFilterDebounced: (() => void) & { cancel(): void };
+  private unsubscribeRuntimeConfig: (() => void) | null = null;
   private unsubscribeAuth: (() => void) | null = null;
   private proBlockUnsubscribe: (() => void) | null = null;
   private proBlockEntitlementUnsubscribe: (() => void) | null = null;
@@ -716,6 +723,10 @@ export class PanelLayoutManager implements AppModule {
       this.updatePanelGating(state);
     });
 
+    this.unsubscribeRuntimeConfig = subscribeRuntimeConfig(() => {
+      this.updatePanelGating(getAuthState());
+    });
+
     // Handle analyst action chip "Create chart widget →" click
     this.boundWidgetCreatorHandler = ((e: CustomEvent<{ initialMessage?: string }>) => {
       void import('@/components/WidgetChatModal').then((m) => m.openWidgetChatModal({
@@ -807,6 +818,8 @@ export class PanelLayoutManager implements AppModule {
     this.checkoutReturnFocusController.abort();
     clearAllPendingCalls();
     this.applyTimeRangeFilterDebounced.cancel();
+    this.unsubscribeRuntimeConfig?.();
+    this.unsubscribeRuntimeConfig = null;
     this.unsubscribeAuth?.();
     this.unsubscribeAuth = null;
     this.proBlockUnsubscribe?.();
@@ -857,6 +870,8 @@ export class PanelLayoutManager implements AppModule {
     this.mobileMapCollapseBtn = null;
     this.panelTabBar?.destroy();
     this.panelTabBar = null;
+    this.unregisterExportFlush?.();
+    this.unregisterExportFlush = null;
     // Clean up happy variant panels
     destroyOnce(this.ctx.tvMode);
     this.ctx.tvMode = null;
@@ -928,13 +943,16 @@ export class PanelLayoutManager implements AppModule {
 
   /** Reactively update premium panel gating based on auth state. */
   private updatePanelGating(state: AuthSession): void {
+    // Also invalidate requests and queued calls when Telegram has not mounted yet.
+    if (this.ctx.isDesktopApp && !hasPremiumAccess(state)) clearTelegramIntelCache();
     // #4771: resolve the billing-aware refinement of FREE_TIER once per pass
     // — the inputs (subscription/entitlement snapshots, now) are invariant
     // across the panel loop, and a single Date.now() keeps every panel on
     // the same verdict at a period-end boundary.
     const billingAwareFreeTier = resolveBillingAwareGateReason(PanelGateReason.FREE_TIER);
     for (const [key, panel] of Object.entries(this.ctx.panels)) {
-      const isPremium = WEB_PREMIUM_PANELS.has(key);
+      const isPremium = WEB_PREMIUM_PANELS.has(key)
+        || (this.ctx.isDesktopApp && key === 'telegram-intel');
       let reason = getPanelGateReason(state, isPremium);
 
       // Clerk-pro-only panels: even when hasPremiumAccess() returns
@@ -1366,12 +1384,27 @@ export class PanelLayoutManager implements AppModule {
       const initial: PanelTab = {
         id: generateTabId(),
         name: t('dashboardTabs.defaultName'),
-        ...this.captureCurrentTabState(),
+        ...this.captureCurrentTabState().snapshot,
       };
       state = { activeTabId: initial.id, tabs: [initial] };
       saveTabsState(state);
     }
     this.tabsState = state;
+    // A settings export reads storage, where the active tab's snapshot is only
+    // refreshed on switch-away. Write the live layout into it first so the
+    // backup carries the tab as it is now, not as it was at the last switch.
+    this.unregisterExportFlush?.();
+    this.unregisterExportFlush = registerSettingsExportFlush(() => {
+      if (!this.tabsState) return;
+      if (!this.snapshotActiveTab().persisted || !saveTabsState(this.tabsState).persisted) {
+        throw new Error('Settings export could not save the current dashboard layout');
+      }
+    }, [
+      `worldmonitor-tabs-v1:${SITE_VARIANT}`,
+      STORAGE_KEYS.panels,
+      this.ctx.PANEL_ORDER_KEY,
+      this.ctx.PANEL_ORDER_KEY + '-bottom-set',
+    ]);
     // Clamp stored snapshots to the current free-tier cap so a workspace saved
     // while Pro (or persisted before the cap existed) can't re-enable an
     // over-cap layout when the user later switches to it. Skips itself while
@@ -1924,22 +1957,30 @@ export class PanelLayoutManager implements AppModule {
   }
 
   /** Capture the live panel state (settings + order) for a tab snapshot. */
-  private captureCurrentTabState(): Pick<PanelTab, 'panelSettings' | 'panelOrder' | 'bottomSet'> {
+  private captureCurrentTabState(): {
+    snapshot: Pick<PanelTab, 'panelSettings' | 'panelOrder' | 'bottomSet'>;
+    persisted: boolean;
+  } {
     // Persist the live DOM order first so the snapshot reflects any drags.
-    this.savePanelOrder();
+    const { persisted } = this.savePanelOrder();
     return {
-      panelSettings: JSON.parse(JSON.stringify(this.ctx.panelSettings)) as Record<string, PanelConfig>,
-      panelOrder: [...this.resolvedPanelOrder],
-      bottomSet: Array.from(this.bottomSetMemory),
+      snapshot: {
+        panelSettings: JSON.parse(JSON.stringify(this.ctx.panelSettings)) as Record<string, PanelConfig>,
+        panelOrder: [...this.resolvedPanelOrder],
+        bottomSet: Array.from(this.bottomSetMemory),
+      },
+      persisted,
     };
   }
 
   /** Refresh the active tab's snapshot from live state (called on switch-away). */
-  private snapshotActiveTab(): void {
-    if (!this.tabsState) return;
+  private snapshotActiveTab(): TabsPersistReceipt {
+    if (!this.tabsState) return { persisted: false };
     const active = this.tabsState.tabs.find((t) => t.id === this.tabsState!.activeTabId);
-    if (!active) return;
-    Object.assign(active, this.captureCurrentTabState());
+    if (!active) return { persisted: false };
+    const { snapshot, persisted } = this.captureCurrentTabState();
+    Object.assign(active, snapshot);
+    return { persisted };
   }
 
   private switchToTab(tabId: string): TabsPersistReceipt {
@@ -2768,6 +2809,7 @@ export class PanelLayoutManager implements AppModule {
     this.createNewsPanel('github', 'panels.github');
     this.createNewsPanel('ipo', 'panels.ipo');
     this.createNewsPanel('thinktanks', 'panels.thinktanks');
+    this.createNewsPanel('science', 'panels.science');
     this.lazyDefaultPanel('economic', () => import('@/components/EconomicPanel'), 'EconomicPanel');
     this.lazyDefaultPanel('global-procurement', () => import('@/components/GlobalProcurementPanel'), 'GlobalProcurementPanel');
     this.lazyDefaultPanel('consumer-prices', () => import('@/components/ConsumerPricesPanel'), 'ConsumerPricesPanel');
@@ -2929,6 +2971,15 @@ export class PanelLayoutManager implements AppModule {
       return p;
     });
 
+    this.lazyImportedPanel('ukmto-incidents', () => import('@/components/UkmtoIncidentsPanel'), 'UkmtoIncidentsPanel', (UkmtoIncidentsPanel) => {
+      const panel = new UkmtoIncidentsPanel();
+      panel.setLocationClickHandler((lat: number, lon: number) => {
+        if (this.ctx.isMobile) this.revealMobileMap();
+        this.ctx.map?.setCenter(lat, lon, 6);
+      });
+      return panel;
+    });
+
     this.lazyImportedPanel('climate', () => import('@/components/ClimateAnomalyPanel'), 'ClimateAnomalyPanel', (ClimateAnomalyPanel) => {
       const p = new ClimateAnomalyPanel();
       p.setZoneClickHandler((lat: number, lon: number) => { this.ctx.map?.setCenter(lat, lon, 4); });
@@ -3007,8 +3058,7 @@ export class PanelLayoutManager implements AppModule {
       'telegram-intel',
       () => import('@/components/TelegramIntelPanel'),
       'TelegramIntelPanel',
-      undefined,
-      _lockPanels ? [t('premium.features.telegramIntel1'), t('premium.features.telegramIntel2')] : undefined,
+      (panel) => panel.setAccessGrantedHandler(() => { void this.callbacks.loadTelegramIntel?.(); }),
     );
 
     this.lazyDefaultPanel(
@@ -3150,6 +3200,7 @@ export class PanelLayoutManager implements AppModule {
     this.lazyDefaultPanel('nq-catalysts', () => import('@/components/NqCatalystsPanel'), 'NqCatalystsPanel');
     this.lazyDefaultPanel('yield-curve', () => import('@/components/YieldCurvePanel'), 'YieldCurvePanel');
     this.lazyDefaultPanel('earnings-calendar', () => import('@/components/EarningsCalendarPanel'), 'EarningsCalendarPanel');
+    this.lazyDefaultPanel('material-events', () => import('@/components/MaterialEventsPanel'), 'MaterialEventsPanel');
     this.lazyDefaultPanel('economic-calendar', () => import('@/components/EconomicCalendarPanel'), 'EconomicCalendarPanel');
     this.lazyDefaultPanel('cot-positioning', () => import('@/components/CotPositioningPanel'), 'CotPositioningPanel');
     this.lazyDefaultPanel('liquidity-shifts', () => import('@/components/LiquidityShiftsPanel'), 'LiquidityShiftsPanel');
@@ -3277,7 +3328,7 @@ export class PanelLayoutManager implements AppModule {
     let allOrder: string[];
 
     if (hasSavedOrder) {
-      const valid = savedOrder.filter(k => activePanelKeys.includes(k));
+      const valid = savedOrder.filter(k => activePanelKeys.includes(k) && (SITE_VARIANT !== 'happy' || k !== 'monitors'));
       const missing = activePanelKeys.filter(k => !valid.includes(k));
 
       missing.forEach(k => {
@@ -3292,9 +3343,7 @@ export class PanelLayoutManager implements AppModule {
         if (!inserted) valid.push(k);
       });
 
-      const monitorsIdx = valid.indexOf('monitors');
-      if (monitorsIdx !== -1) valid.splice(monitorsIdx, 1);
-      if (SITE_VARIANT !== 'happy') valid.push('monitors');
+      if (SITE_VARIANT !== 'happy' && !valid.includes('monitors')) valid.push('monitors');
       allOrder = valid;
     } else {
       allOrder = [...defaultOrder];
@@ -3518,7 +3567,7 @@ export class PanelLayoutManager implements AppModule {
 
   private scheduleLoadAllData(phase: HydrationSchedulePhase = 'near'): void {
     if (typeof window === 'undefined') {
-      void this.callbacks.loadAllData();
+      void this.callbacks.loadAllData(false, 'viewport');
       return;
     }
     const mark = (label: string) => {
@@ -3533,7 +3582,7 @@ export class PanelLayoutManager implements AppModule {
         this.scheduledLoadAllIdle = idle(() => {
           this.scheduledLoadAllIdle = null;
           mark('wm:hydration:near-trigger');
-          void this.callbacks.loadAllData();
+          void this.callbacks.loadAllData(false, 'viewport');
         }, { timeout: 300 });
         return;
       }
@@ -3547,7 +3596,7 @@ export class PanelLayoutManager implements AppModule {
     this.scheduledLoadAllRaf = window.requestAnimationFrame(() => {
       this.scheduledLoadAllRaf = null;
       mark(`wm:hydration:${phase}-trigger`);
-      void this.callbacks.loadAllData();
+      void this.callbacks.loadAllData(false, 'viewport');
     });
   }
 
@@ -4450,6 +4499,7 @@ export class PanelLayoutManager implements AppModule {
             this.bottomSetMemory.delete(key);
           }
           this.savePanelOrder();
+          trackLayoutCustomized('panel-reorder');
         }
       }
       dragStarted = false;
@@ -4507,7 +4557,10 @@ export class PanelLayoutManager implements AppModule {
             bottomGrid,
             bottomSet: this.bottomSetMemory,
           });
-          if (moved) this.savePanelOrder();
+          if (moved) {
+            this.savePanelOrder();
+            trackLayoutCustomized('panel-reorder');
+          }
           moveBtn.focus();
           return;
         }
@@ -4524,6 +4577,7 @@ export class PanelLayoutManager implements AppModule {
         if (back) parent.insertBefore(el, sibling);
         else parent.insertBefore(el, sibling.nextElementSibling);
         this.savePanelOrder();
+        trackLayoutCustomized('panel-reorder');
         // The button travels with the panel; keep focus on it so repeated
         // presses keep moving the same panel.
         moveBtn.focus();

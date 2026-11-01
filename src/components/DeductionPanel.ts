@@ -18,10 +18,28 @@ const getIntelligenceClient = createLazyClient(() => new IntelligenceServiceClie
 
 const COOLDOWN_MS = 5_000;
 
+// The analysis is LLM markdown grounded on RSS headlines, so a headline that
+// smuggles markup into the model's output must not become a tracking pixel or
+// an outbound link. Text structure only: no images, anchors, or attributes
+// beyond class. Same shape as ChatAnalystPanel's ANALYST_PURIFY_CONFIG plus
+// headings and blockquotes, which the deduction prompt's sections produce.
+export const DEDUCTION_PURIFY_CONFIG = {
+  ALLOWED_TAGS: ['p', 'strong', 'em', 'b', 'i', 'br', 'hr',
+    'ul', 'ol', 'li', 'code', 'pre', 'blockquote',
+    'h1', 'h2', 'h3', 'h4',
+    'table', 'thead', 'tbody', 'tr', 'th', 'td',
+    'div', 'span'],
+  ALLOWED_ATTR: ['class'],
+  ALLOW_DATA_ATTR: false,
+  // DOMPurify keeps aria-* even when ALLOWED_ATTR omits them; an injected
+  // aria-hidden would hide the analysis from screen readers.
+  ALLOW_ARIA_ATTR: false,
+};
+
 export class DeductionPanel extends Panel {
     private formEl: HTMLFormElement;
     private inputEl: HTMLTextAreaElement;
-    private geoInputEl: HTMLInputElement;
+    private geoInputEl: HTMLTextAreaElement;
     private resultContainer: HTMLElement;
     private contentRoot: HTMLElement;
     private submitBtn: HTMLButtonElement;
@@ -46,11 +64,11 @@ export class DeductionPanel extends Panel {
             rows: 3,
         }) as HTMLTextAreaElement;
 
-        this.geoInputEl = h('input', {
+        this.geoInputEl = h('textarea', {
             className: 'deduction-geo-input',
-            type: 'text',
+            rows: 2,
             placeholder: 'Geographic or situation context (optional)...',
-        }) as HTMLInputElement;
+        }) as HTMLTextAreaElement;
 
         this.submitBtn = h('button', {
             className: 'deduction-submit-btn',
@@ -109,9 +127,14 @@ export class DeductionPanel extends Panel {
     }
 
     private deductionGeneration = 0;
+    private deductionAbort: AbortController | null = null;
 
     public override clearSensitiveContent(): void {
         this.deductionGeneration += 1;
+        // The previous account's request must not keep running (and spending
+        // its quota) after the reset; discarding its result is not enough.
+        this.deductionAbort?.abort();
+        this.deductionAbort = null;
         this.inputEl.value = '';
         this.geoInputEl.value = '';
         this.resultContainer.replaceChildren();
@@ -262,6 +285,9 @@ export class DeductionPanel extends Panel {
         const fw = getActiveFrameworkForPanel('deduction');
 
         const generation = ++this.deductionGeneration;
+        this.deductionAbort?.abort();
+        const controller = new AbortController();
+        this.deductionAbort = controller;
         this.isSubmitting = true;
         this.submitBtn.disabled = true;
 
@@ -279,7 +305,7 @@ export class DeductionPanel extends Panel {
                 query,
                 geoContext,
                 framework: fw?.systemPromptAppend ?? '',
-            });
+            }, { signal: controller.signal });
             if (generation !== this.deductionGeneration || !this.element?.isConnected) return;
 
             this.resultContainer.className = 'deduction-result';
@@ -291,7 +317,7 @@ export class DeductionPanel extends Panel {
                 // task instead of running parse+purify+innerHTML as one block (#4537).
                 await yieldToMain();
                 if (generation !== this.deductionGeneration || !this.element?.isConnected) return;
-                const safe = DOMPurify.sanitize(parsed);
+                const safe = DOMPurify.sanitize(parsed, DEDUCTION_PURIFY_CONFIG);
                 setTrustedHtml(this.resultContainer, trustedHtml(safe, 'legacy direct innerHTML migration'));
                 this.reformatResult(this.resultContainer);
             } else {
@@ -305,6 +331,7 @@ export class DeductionPanel extends Panel {
             this.resultContainer.className = 'deduction-result error';
             this.resultContainer.textContent = 'An error occurred while analyzing the situation.';
         } finally {
+            if (this.deductionAbort === controller) this.deductionAbort = null;
             if (generation === this.deductionGeneration) {
                 this.isSubmitting = false;
                 if (this.element?.isConnected) {
